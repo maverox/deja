@@ -1,0 +1,226 @@
+syntax = "proto3";
+package deja.v1;
+
+message RecordedEvent {
+  string trace_id = 1;
+  string span_id = 2;
+  optional string parent_span_id = 3;
+  uint64 sequence = 4;
+  uint64 timestamp_ns = 5;
+  string connection_id = 6;
+  
+  oneof event {
+    HttpRequestEvent http_request = 10;
+    HttpResponseEvent http_response = 11;
+    DbQueryEvent db_query = 12;
+    DbResultEvent db_result = 13;
+    CacheGetEvent cache_get = 14;
+    CacheSetEvent cache_set = 15;
+    ExternalCallEvent external_call = 16;
+    NonDeterministicEvent non_deterministic = 17;
+    RedisCommandEvent redis_command = 18;
+    RedisResponseEvent redis_response = 19;
+    PgMessageEvent pg_message = 20;
+  }
+  
+  map<string, string> metadata = 100;
+}
+
+message HttpRequestEvent {
+  string method = 1;
+  string path = 2;
+  map<string, string> headers = 3;
+  bytes body = 4;
+  string schema = 5; // http/https
+  string host = 6;
+}
+
+message HttpResponseEvent {
+   uint32 status = 1;
+   map<string, string> headers = 2;
+   bytes body = 3;
+   uint64 latency_ms = 4;
+}
+
+message DbQueryEvent {
+  DbType db_type = 1;
+  string query = 2;
+  // params would be complex to serialize, simplified for now
+  string connection_id = 4;
+}
+
+enum DbType {
+  DB_TYPE_UNSPECIFIED = 0;
+  DB_TYPE_POSTGRES = 1;
+  DB_TYPE_MYSQL = 2;
+  DB_TYPE_SQLITE = 3;
+  DB_TYPE_MONGODB = 4;
+}
+
+message DbResultEvent {
+    uint64 affected_rows = 1;
+    // Result set data omitted for brevity in Phase 1
+}
+
+message CacheGetEvent {
+  CacheType cache_type = 1;
+  string key = 2;
+  optional bytes value = 3;
+  bool hit = 4;
+}
+
+enum CacheType {
+  CACHE_TYPE_UNSPECIFIED = 0;
+  CACHE_TYPE_REDIS = 1;
+  CACHE_TYPE_MEMCACHED = 2;
+  CACHE_TYPE_LOCAL = 3;
+}
+
+message CacheSetEvent {
+    CacheType cache_type = 1;
+    string key = 2;
+    bytes value = 3;
+    optional uint64 ttl_ms = 4;
+}
+
+message ExternalCallEvent {
+    string service_name = 1;
+    // Recursive or simplified? Phase 1: simplified
+    string operation = 2;
+}
+
+message NonDeterministicEvent {
+    oneof kind {
+        uint64 time_capture_ns = 1;
+        uint64 random_seed_capture = 2;
+        string uuid_capture = 3;
+    }
+}
+
+message RedisCommandEvent {
+    string command = 1;
+    repeated RedisValue args = 2;
+}
+
+message RedisResponseEvent {
+    RedisValue value = 1;
+}
+
+message RedisValue {
+    oneof kind {
+        bool null = 1;
+        string simple_string = 2;
+        string error = 3;
+        int64 integer = 4;
+        bytes bulk_string = 5;
+        RedisArray array = 6;
+        bool boolean = 7;
+        double double = 8;
+        RedisMap map = 9;
+        bool null_resp3 = 10;
+        bytes verbatim_string = 11;
+    }
+}
+
+message RedisMap {
+    repeated RedisKeyValuePair entries = 1;
+}
+
+message RedisKeyValuePair {
+    RedisValue key = 1;
+    RedisValue value = 2;
+}
+
+message RedisArray {
+    repeated RedisValue values = 1;
+}
+
+// Postgres Specifics
+
+// Extends DbResultEvent or used within it? 
+// For now, let's keep DB events somewhat generic but with specific details.
+// Actually, let's use the DbResultEvent for generic summary, but maybe we need a PgRowEvent?
+// No, protocol level events are better.
+
+message PgMessageEvent {
+    oneof message {
+        PgStartup startup = 1;
+        PgQuery query = 2;
+        PgParse parse = 3;
+        PgBind bind = 4;
+        PgExecute execute = 5;
+        PgRowDescription row_desc = 6;
+        PgDataRow data_row = 7;
+        PgCommandComplete command_complete = 8;
+        string error_response = 9;
+        PgSimpleResponse parse_complete = 10;
+        PgSimpleResponse bind_complete = 11;
+        PgSimpleResponse no_data = 12;
+        PgSimpleResponse sync = 13;
+        PgSimpleResponse authentication_ok = 14;
+        PgParameterStatus parameter_status = 15;
+        PgBackendKeyData backend_key_data = 16;
+        PgReadyForQuery ready_for_query = 17;
+    }
+}
+
+message PgSimpleResponse {}
+
+message PgParameterStatus {
+    string name = 1;
+    string value = 2;
+}
+
+message PgBackendKeyData {
+    uint32 process_id = 1;
+    uint32 secret_key = 2;
+}
+
+message PgReadyForQuery {
+    string status = 1; // 'I', 'T', or 'E'
+}
+
+
+message PgStartup {
+    string user = 1;
+    string database = 2;
+}
+
+message PgQuery {
+    string query = 1;
+}
+
+message PgParse {
+    string query = 1;
+    string name = 2;
+    repeated uint32 param_types = 3;
+}
+
+message PgBind {
+    string portal = 1;
+    string statement = 2;
+    // params omitted for brevity in Phase 3 start
+}
+
+message PgExecute {
+    string portal = 1;
+    uint32 max_rows = 2;
+}
+
+message PgRowDescription {
+    repeated PgColumn fields = 1;
+}
+
+message PgColumn {
+    string name = 1;
+    uint32 table_oid = 2;
+    uint32 type_oid = 3;
+}
+
+message PgDataRow {
+    repeated bytes values = 1; // null can be empty bytes for now or we need a wrapper
+}
+
+message PgCommandComplete {
+    string tag = 1;
+}

@@ -1,0 +1,61 @@
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: deja_user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: deja_test
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+
+  # Proxy for Redis
+  deja-redis:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    command: ["--listen", "0.0.0.0:6390", "--target", "redis:6379", "--record-dir", "/data/recordings"]
+    volumes:
+      - ./recordings:/data/recordings
+    ports:
+      - "6390:6390"
+    depends_on:
+      - redis
+
+  # Proxy for Postgres
+  deja-postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    command: ["--listen", "0.0.0.0:5433", "--target", "postgres:5432", "--record-dir", "/data/recordings"]
+    volumes:
+      - ./recordings:/data/recordings
+    ports:
+      - "5433:5433"
+    depends_on:
+      - postgres
+
+  # HTTP Echo Service
+  http-target:
+    image: containous/whoami
+    ports:
+      - "80:80"
+
+  # Proxy for HTTP
+  deja-http:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    command: ["--listen", "0.0.0.0:8080", "--target", "http-target:80", "--record-dir", "/data/recordings"]
+    volumes:
+      - ./recordings:/data/recordings
+    ports:
+      - "8080:8080"
+    depends_on:
+      - http-target
