@@ -5,12 +5,14 @@ use deja_core::protocols::http::HttpParser;
 use deja_core::protocols::postgres::PostgresParser;
 use deja_core::protocols::redis::RedisParser;
 use deja_core::protocols::ProtocolParser;
+use deja_core::tls_mitm::TlsMitmManager;
 
 use deja_core::recording::Recorder;
 use deja_core::replay::{ReplayEngine, ReplayMode};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -169,8 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let listen_port = parts[0].to_string(); // Own it
-        let target_host = parts[1];
+        let listen_port = parts[0].to_string();
+        let target_host = parts[1].to_string(); // Own it for 'static lifetime
         let target_port = parts[2];
 
         let listen_addr = format!("0.0.0.0:{}", listen_port);
@@ -182,7 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let recorder_clone = recorder.clone();
         let replay_engine_clone = replay_engine.clone();
         let parsers_clone = parsers_arc.clone();
-        let _tls_manager_clone = tls_manager.clone(); // Available for TLS MITM when needed
+        let tls_manager_clone = tls_manager.clone();
 
         // Task for this listener
         tasks.push(tokio::spawn(async move {
@@ -194,10 +196,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rec = recorder_clone.clone();
                         let rep = replay_engine_clone.clone();
                         let ps = parsers_clone.clone();
-                        let lp = listen_port.clone(); // Clone for inner task
+                        let lp = listen_port.clone();
+                        let tls_mgr = tls_manager_clone.clone();
+                        let th = target_host.clone();
 
-                        // Optimization: Spawn connection handler immediately
+                        // Spawn connection handler
                         tokio::spawn(async move {
+                            // Check for TLS handshake
+                            if let Some(tls_manager) = &tls_mgr {
+                                if is_tls_handshake(&client_socket).await {
+                                    println!("[{}] TLS handshake detected, initiating MITM", lp);
+                                    if let Err(e) = handle_tls_connection(
+                                        client_socket,
+                                        target,
+                                        &th,
+                                        tls_manager.clone(),
+                                        ps,
+                                        rec,
+                                        rep,
+                                    ).await {
+                                        eprintln!("[{}] TLS connection error: {}", lp, e);
+                                    }
+                                    return;
+                                }
+                            }
+
+                            // Plain connection
                             let detected_parser = detect_protocol(&client_socket, &ps).await;
                             if let Err(e) =
                                 handle_connection(client_socket, target, detected_parser, rec, rep)
@@ -217,6 +241,274 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     futures::future::join_all(tasks).await;
 
     Ok(())
+}
+
+/// Detect if the connection starts with a TLS handshake
+/// TLS record format: 0x16 (handshake) 0x03 0x0X (version)
+async fn is_tls_handshake(stream: &TcpStream) -> bool {
+    let mut buf = [0u8; 3];
+    match stream.peek(&mut buf).await {
+        Ok(n) if n >= 3 => {
+            // TLS handshake starts with: 0x16 (ContentType: Handshake) 0x03 0x0X (Version)
+            buf[0] == 0x16 && buf[1] == 0x03 && buf[2] <= 0x03
+        }
+        _ => false,
+    }
+}
+
+/// Handle a TLS connection with MITM interception
+async fn handle_tls_connection(
+    client_stream: TcpStream,
+    target_addr: String,
+    target_host: &str,
+    tls_manager: Arc<TlsMitmManager>,
+    parsers: Arc<Vec<Arc<dyn ProtocolParser>>>,
+    recorder: Option<Arc<Recorder>>,
+    replay_engine: Option<Arc<tokio::sync::Mutex<ReplayEngine>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Generate server config for this host (dynamically signed cert)
+    let server_config = tls_manager.generate_server_config(target_host)?;
+    let acceptor = TlsAcceptor::from(server_config);
+
+    // Accept TLS from client
+    let tls_client_stream = acceptor.accept(client_stream).await?;
+    println!("[TLS] Accepted TLS connection for host: {}", target_host);
+
+    // For protocol detection, we need to peek the decrypted data
+    // Split the TLS stream for bidirectional handling
+    let (mut c_read, c_write) = tokio::io::split(tls_client_stream);
+
+    // In replay mode, we don't connect to the real target
+    let target_stream = if replay_engine.is_none() {
+        // Connect to target with TLS
+        let target_tcp = TcpStream::connect(&target_addr).await?;
+        let client_config = tls_manager.client_config();
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let server_name = rustls::pki_types::ServerName::try_from(target_host.to_string())?;
+        let tls_target = connector.connect(server_name, target_tcp).await?;
+        Some(tls_target)
+    } else {
+        None
+    };
+
+    // Detect protocol from first decrypted bytes
+    let mut peek_buf = [0u8; 1024];
+    let peeked = {
+        // We need to actually read since we can't peek TLS
+        // Use a buffered approach - read and then prepend to further processing
+        let n = c_read.read(&mut peek_buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        n
+    };
+
+    let detected_parser = detect_protocol_from_bytes(&peek_buf[..peeked], &parsers);
+    println!("[TLS] Detected protocol: {}", detected_parser.protocol_id());
+
+    // Handle the connection with decrypted streams
+    // Note: We already consumed some bytes, need to handle them
+    let c_write = Arc::new(tokio::sync::Mutex::new(c_write));
+
+    let (t_read, t_write) = if let Some(ts) = target_stream {
+        let (tr, tw) = tokio::io::split(ts);
+        (Some(tr), Some(Arc::new(tokio::sync::Mutex::new(tw))))
+    } else {
+        (None, None)
+    };
+
+    let connection_id = uuid::Uuid::new_v4().to_string();
+    let connection_parser = detected_parser.new_connection(connection_id);
+    let parser_lock = Arc::new(tokio::sync::Mutex::new(connection_parser));
+
+    // Process the initial peeked data first
+    {
+        let mut p = parser_lock.lock().await;
+        match p.parse_client_data(&peek_buf[..peeked]) {
+            Ok(res) => {
+                for event in res.events {
+                    if let Some(rec) = &recorder {
+                        let _ = rec.save_event(&event).await;
+                    }
+
+                    if let Some(engine_lock) = &replay_engine {
+                        let mut engine = engine_lock.lock().await;
+                        if let Some((_, responses)) = engine.find_match_with_responses(&event) {
+                            let mut cw = c_write.lock().await;
+                            for resp in responses {
+                                cw.write_all(&resp).await?;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(tw) = &t_write {
+                    if !res.forward.is_empty() {
+                        let mut tw = tw.lock().await;
+                        tw.write_all(&res.forward).await?;
+                    }
+                }
+
+                if let Some(reply) = res.reply {
+                    let mut cw = c_write.lock().await;
+                    cw.write_all(&reply).await?;
+                }
+            }
+            Err(_) => {
+                if let Some(tw) = &t_write {
+                    let mut tw = tw.lock().await;
+                    tw.write_all(&peek_buf[..peeked]).await?;
+                }
+            }
+        }
+    }
+
+    // Continue with bidirectional proxying using the generic handler
+    let c_write_clone = c_write.clone();
+    let t_write_clone = t_write.clone();
+    let parser_lock_clone = parser_lock.clone();
+    let recorder_clone = recorder.clone();
+    let replay_engine_clone = replay_engine.clone();
+    let parser_arc_clone = detected_parser.clone();
+
+    // Client -> Target handler
+    let c_handle = async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = c_read.read(&mut buf).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            if n == 0 {
+                break;
+            }
+
+            let mut p = parser_lock_clone.lock().await;
+            match p.parse_client_data(&buf[..n]) {
+                Ok(res) => {
+                    for event in res.events {
+                        if let Some(rec) = &recorder_clone {
+                            let _ = rec.save_event(&event).await;
+                        }
+
+                        if let Some(engine_lock) = &replay_engine_clone {
+                            let mut engine = engine_lock.lock().await;
+                            if let Some((_, responses)) = engine.find_match_with_responses(&event) {
+                                let mut cw = c_write_clone.lock().await;
+                                for resp in responses {
+                                    cw.write_all(&resp).await.map_err(|e| {
+                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                                    })?;
+                                }
+                            } else {
+                                let protocol = parser_arc_clone.protocol_id();
+                                let error_bytes = match protocol {
+                                    "redis" => b"-ERR No replay match found\r\n".to_vec(),
+                                    "http" => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                                    "postgres" => {
+                                        deja_core::protocols::postgres::PgSerializer::serialize_error("No Replay Match").to_vec()
+                                    }
+                                    _ => vec![],
+                                };
+                                if !error_bytes.is_empty() {
+                                    let mut cw = c_write_clone.lock().await;
+                                    let _ = cw.write_all(&error_bytes).await;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(tw) = &t_write_clone {
+                        if !res.forward.is_empty() {
+                            let mut tw = tw.lock().await;
+                            tw.write_all(&res.forward).await.map_err(|e| {
+                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                            })?;
+                        }
+                    }
+
+                    if let Some(reply) = res.reply {
+                        let mut cw = c_write_clone.lock().await;
+                        cw.write_all(&reply).await.map_err(|e| {
+                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                        })?;
+                    }
+                }
+                Err(_) => {
+                    if let Some(tw) = &t_write_clone {
+                        let mut tw = tw.lock().await;
+                        tw.write_all(&buf[..n]).await.map_err(|e| {
+                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                        })?;
+                    }
+                }
+            }
+        }
+        if let Some(tw) = &t_write_clone {
+            let mut tw = tw.lock().await;
+            let _ = tw.shutdown().await;
+        }
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    };
+
+    // Target -> Client handler
+    let c_write_clone2 = c_write.clone();
+    let parser_lock_clone2 = parser_lock.clone();
+    let recorder_clone2 = recorder.clone();
+
+    let t_handle = async move {
+        if let Some(mut tr) = t_read {
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = tr.read(&mut buf).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                if n == 0 {
+                    break;
+                }
+
+                let slice = &buf[..n];
+                let mut p = parser_lock_clone2.lock().await;
+                if let Ok(res) = p.parse_server_data(slice) {
+                    for event in res.events {
+                        if let Some(rec) = &recorder_clone2 {
+                            let _ = rec.save_event(&event).await;
+                        }
+                    }
+                    let mut cw = c_write_clone2.lock().await;
+                    cw.write_all(&res.forward).await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                } else {
+                    let mut cw = c_write_clone2.lock().await;
+                    cw.write_all(slice).await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                }
+            }
+            let mut cw = c_write_clone2.lock().await;
+            let _ = cw.shutdown().await;
+        }
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    };
+
+    tokio::try_join!(c_handle, t_handle)?;
+    Ok(())
+}
+
+/// Detect protocol from bytes (for TLS where we can't peek)
+fn detect_protocol_from_bytes(
+    data: &[u8],
+    parsers: &[Arc<dyn ProtocolParser>],
+) -> Arc<dyn ProtocolParser> {
+    let mut best_score = 0.0;
+    let mut best_idx = 0;
+    for (i, p) in parsers.iter().enumerate() {
+        let score = p.detect(data);
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    if best_score > 0.0 {
+        return parsers[best_idx].clone();
+    }
+    Arc::new(RedisParser)
 }
 
 async fn detect_protocol(

@@ -88,7 +88,6 @@ impl ReplayEngine {
         &mut self,
         incoming: &RecordedEvent,
     ) -> Option<(RecordedEvent, Vec<bytes::Bytes>)> {
-        use crate::protocols::postgres::PgSerializer;
         let idx = self.find_match_index(incoming)?;
         self.visited[idx] = true;
         let matched_req = self.recordings[idx].clone();
