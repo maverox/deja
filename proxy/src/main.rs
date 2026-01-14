@@ -5,7 +5,7 @@ use deja_core::protocols::redis::RedisParser;
 use deja_core::protocols::ProtocolParser;
 
 use deja_core::recording::Recorder;
-use deja_core::replay::ReplayEngine;
+use deja_core::replay::{ReplayEngine, ReplayMode};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,14 +14,19 @@ use tokio::net::{TcpListener, TcpStream};
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Port mappings in format PORT:TARGET_HOST:TARGET_PORT (e.g., 5433:127.0.0.1:5432)
+    /// Can also use DEJA_PORT_MAPS env var (comma-separated)
     #[arg(long = "map")]
     maps: Vec<String>,
 
+    /// Directory for recordings
+    /// Can also use DEJA_RECORDING_PATH env var
     #[arg(long, default_value = "recordings")]
     record_dir: String,
 
+    /// Mode: record, replay, or orchestrated
+    /// Can also use DEJA_MODE env var
     #[arg(long, default_value = "record")]
-    mode: String, // record or replay
+    mode: String,
 }
 
 #[tokio::main]
@@ -29,27 +34,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    if args.maps.is_empty() {
-        eprintln!("Error: No mappings provided. Use --map PORT:TARGET_HOST:TARGET_PORT");
+    // Support env vars as fallback
+    let mode_str = if args.mode != "record" {
+        args.mode.clone()
+    } else {
+        std::env::var("DEJA_MODE").unwrap_or_else(|_| args.mode.clone())
+    };
+
+    let record_dir = std::env::var("DEJA_RECORDING_PATH").unwrap_or_else(|_| args.record_dir.clone());
+
+    let mut maps = args.maps.clone();
+    if maps.is_empty() {
+        // Try env var
+        if let Ok(env_maps) = std::env::var("DEJA_PORT_MAPS") {
+            maps = env_maps.split(',').map(String::from).collect();
+        }
+    }
+
+    if maps.is_empty() {
+        eprintln!("Error: No mappings provided. Use --map PORT:TARGET_HOST:TARGET_PORT or DEJA_PORT_MAPS env var");
         std::process::exit(1);
     }
 
-    println!("Starting Deja Proxy in {} mode", args.mode);
-    println!("Output Directory: {}", args.record_dir);
+    let mode = ReplayMode::from_str(&mode_str);
+    println!("Starting Deja Proxy in {:?} mode", mode);
+    println!("Recording Directory: {}", record_dir);
 
-    // Initialize Shared State
-    let recorder = if args.mode == "record" {
-        Some(Arc::new(Recorder::new(&args.record_dir).await))
-    } else {
-        None
+    // Initialize Shared State based on mode
+    let recorder = match mode {
+        ReplayMode::Recording => Some(Arc::new(Recorder::new(&record_dir).await)),
+        _ => None,
     };
 
-    let replay_engine = if args.mode == "replay" {
-        println!("Loading replay engine from {}", args.record_dir);
-        let engine = ReplayEngine::new(&args.record_dir).await?;
-        Some(Arc::new(tokio::sync::Mutex::new(engine)))
-    } else {
-        None
+    let replay_engine = match mode {
+        ReplayMode::FullMock | ReplayMode::Orchestrated => {
+            println!("Loading replay engine from {}", record_dir);
+            let engine = ReplayEngine::new(&record_dir).await?;
+            println!("Loaded {} recordings, {} remaining", engine.total_count(), engine.remaining_count());
+            Some(Arc::new(tokio::sync::Mutex::new(engine)))
+        }
+        _ => None,
     };
 
     let parsers: Vec<Arc<dyn ProtocolParser>> = vec![
@@ -62,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn listeners
     let mut tasks = Vec::new();
 
-    for map in args.maps {
+    for map in maps {
         let parts: Vec<&str> = map.split(':').collect();
         if parts.len() != 3 {
             eprintln!(
