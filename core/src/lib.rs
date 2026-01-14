@@ -3,6 +3,8 @@ pub mod hash;
 pub mod protocols;
 pub mod recording;
 pub mod replay;
+pub mod runtime;
+pub mod tls_mitm;
 
 // Re-export generated protobuf modules
 pub mod proto {

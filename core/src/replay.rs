@@ -2,6 +2,35 @@ use crate::events::{pg_message_event, recorded_event, redis_value, RecordedEvent
 use std::path::PathBuf;
 use tokio::fs;
 
+/// Mode for the proxy operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayMode {
+    /// Pass through to real backends and record all traffic
+    Recording,
+    /// Return recorded responses without hitting real backends
+    FullMock,
+    /// Orchestrated replay - trigger recorded flows against service
+    Orchestrated,
+}
+
+impl Default for ReplayMode {
+    fn default() -> Self {
+        Self::Recording
+    }
+}
+
+impl ReplayMode {
+    /// Parse from string (for env var)
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "record" | "recording" => Self::Recording,
+            "replay" | "fullmock" | "mock" => Self::FullMock,
+            "orchestrated" | "orchestrate" => Self::Orchestrated,
+            _ => Self::Recording,
+        }
+    }
+}
+
 pub struct ReplayEngine {
     recordings: Vec<RecordedEvent>,
     visited: Vec<bool>,
@@ -346,6 +375,54 @@ impl ReplayEngine {
             }
         }
         None
+    }
+
+    /// Look for the next available UUID capture event
+    pub fn handle_uuid_request(&mut self) -> Option<String> {
+        for (index, recorded) in self.recordings.iter().enumerate() {
+            if self.visited[index] {
+                continue;
+            }
+
+            if let Some(recorded_event::Event::NonDeterministic(nd_event)) = &recorded.event {
+                if let Some(crate::events::non_deterministic_event::Kind::UuidCapture(uuid_str)) =
+                    &nd_event.kind
+                {
+                    self.visited[index] = true;
+                    return Some(uuid_str.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Look for the next available random seed capture event
+    pub fn handle_random_request(&mut self) -> Option<u64> {
+        for (index, recorded) in self.recordings.iter().enumerate() {
+            if self.visited[index] {
+                continue;
+            }
+
+            if let Some(recorded_event::Event::NonDeterministic(nd_event)) = &recorded.event {
+                if let Some(crate::events::non_deterministic_event::Kind::RandomSeedCapture(seed)) =
+                    &nd_event.kind
+                {
+                    self.visited[index] = true;
+                    return Some(*seed);
+                }
+            }
+        }
+        None
+    }
+
+    /// Get count of remaining unvisited recordings
+    pub fn remaining_count(&self) -> usize {
+        self.visited.iter().filter(|&&v| !v).count()
+    }
+
+    /// Get total recordings count
+    pub fn total_count(&self) -> usize {
+        self.recordings.len()
     }
 }
 
