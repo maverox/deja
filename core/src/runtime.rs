@@ -5,6 +5,7 @@
 //! - UUID generation
 //! - Timestamps
 //! - Random number generation
+//! - Task spawning (async boundaries)
 //!
 //! In production mode, these return real values.
 //! In recording mode, values are captured and sent to the proxy.
@@ -12,8 +13,11 @@
 
 use async_trait::async_trait;
 use std::env;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Trait for handling non-deterministic operations in a replay-friendly way.
@@ -44,6 +48,24 @@ pub trait DejaRuntime: Send + Sync {
     async fn nanoid(&self) -> String;
 }
 
+/// Trait for async boundary operations (task spawning)
+/// These are separate from DejaRuntime because they involve generics that
+/// don't work well with async_trait.
+pub trait DejaAsyncBoundary: Send + Sync {
+    /// Spawn a named task. In recording mode, the spawn is recorded.
+    /// In replay mode, spawn ordering may be enforced (future enhancement).
+    fn spawn<F, T>(&self, name: &str, future: F) -> JoinHandle<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static;
+
+    /// Spawn a blocking task with a name
+    fn spawn_blocking<F, T>(&self, name: &str, f: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static;
+}
+
 /// Production runtime - generates real values, no recording/replay
 pub struct ProductionRuntime;
 
@@ -56,6 +78,26 @@ impl ProductionRuntime {
 impl Default for ProductionRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl DejaAsyncBoundary for ProductionRuntime {
+    fn spawn<F, T>(&self, _name: &str, future: F) -> JoinHandle<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        // In production mode, just spawn without recording
+        tokio::spawn(future)
+    }
+
+    fn spawn_blocking<F, T>(&self, _name: &str, f: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        // In production mode, just spawn without recording
+        tokio::task::spawn_blocking(f)
     }
 }
 
@@ -108,6 +150,7 @@ pub struct NetworkRuntime {
     proxy_url: String,
     trace_id: Arc<RwLock<String>>,
     mode: String,
+    task_sequence: Arc<AtomicU64>,
 }
 
 /// Request body for /capture endpoint
@@ -137,6 +180,7 @@ impl NetworkRuntime {
             proxy_url: env::var("DEJA_PROXY_URL").unwrap_or_else(|_| "http://localhost:9999".into()),
             trace_id: Arc::new(RwLock::new(String::new())),
             mode: env::var("DEJA_MODE").unwrap_or_else(|_| "production".into()),
+            task_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -147,6 +191,7 @@ impl NetworkRuntime {
             proxy_url,
             trace_id: Arc::new(RwLock::new(String::new())),
             mode,
+            task_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -167,6 +212,7 @@ impl NetworkRuntime {
             proxy_url: self.proxy_url.clone(),
             trace_id: Arc::new(RwLock::new(trace_id)),
             mode: self.mode.clone(),
+            task_sequence: self.task_sequence.clone(),
         }
     }
 
@@ -317,6 +363,67 @@ impl DejaRuntime for NetworkRuntime {
         (0..21)
             .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
             .collect()
+    }
+}
+
+impl DejaAsyncBoundary for NetworkRuntime {
+    fn spawn<F, T>(&self, name: &str, future: F) -> JoinHandle<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let trace_id = self.trace_id();
+        let task_seq = self.task_sequence.fetch_add(1, Ordering::SeqCst);
+        let task_name = name.to_string();
+        let proxy_url = self.proxy_url.clone();
+        let client = self.client.clone();
+        let mode = self.mode.clone();
+
+        tokio::spawn(async move {
+            // Record task spawn in record mode
+            if mode == "record" {
+                let value = format!("{}:{}", task_name, task_seq);
+                let req = CaptureRequest {
+                    trace_id: trace_id.clone(),
+                    kind: "task_spawn".to_string(),
+                    value,
+                };
+                let _ = client
+                    .post(format!("{}/capture", proxy_url))
+                    .json(&req)
+                    .send()
+                    .await;
+            }
+
+            // Execute the actual future
+            future.await
+        })
+    }
+
+    fn spawn_blocking<F, T>(&self, name: &str, f: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        // For blocking tasks, we record similarly but execute via spawn_blocking
+        let trace_id = self.trace_id();
+        let task_seq = self.task_sequence.fetch_add(1, Ordering::SeqCst);
+        let task_name = name.to_string();
+        let mode = self.mode.clone();
+
+        if mode == "record" {
+            // Note: We can't easily make a network call here synchronously
+            // For now, just log the spawn. Full implementation would need
+            // a background queue to handle recording.
+            tracing::debug!(
+                trace_id = %trace_id,
+                task_name = %task_name,
+                task_seq = %task_seq,
+                "Recording blocking task spawn"
+            );
+        }
+
+        tokio::task::spawn_blocking(f)
     }
 }
 

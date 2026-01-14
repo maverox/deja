@@ -2,13 +2,14 @@ use deja_core::events::RecordedEvent;
 use deja_core::protocols::http::HttpParser;
 use deja_core::protocols::ProtocolParser;
 use deja_core::recording::Recorder;
-use tokio::fs;
+use std::io::Read;
 
 #[tokio::test]
 async fn test_http_parse_and_record() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup Recorder
     let temp_dir = tempfile::tempdir()?;
     let recorder = Recorder::new(temp_dir.path()).await;
+    let session_id = recorder.get_session_id().to_string();
 
     // 2. Setup Parser
     let parser = HttpParser;
@@ -42,14 +43,32 @@ async fn test_http_parse_and_record() -> Result<(), Box<dyn std::error::Error>> 
     recorder.save_event(event).await?;
 
     // 6. Verify Disk Storage
-    let mut dir = fs::read_dir(temp_dir.path()).await?;
-    let entry = dir.next_entry().await?.expect("Should have one file");
+    // Events are stored in binary format at sessions/{session_id}/events.bin
+    let events_path = temp_dir.path()
+        .join("sessions")
+        .join(&session_id)
+        .join("events.bin");
 
-    let content = fs::read_to_string(entry.path()).await?;
-    println!("Recorded content: {}", content);
+    assert!(events_path.exists(), "Events file should exist");
 
-    let saved_event: RecordedEvent = serde_json::from_str(&content)?;
+    // Read the binary file (format: [length:u32][event_bytes])
+    let mut file = std::fs::File::open(&events_path)?;
+    let mut length_bytes = [0u8; 4];
+    file.read_exact(&mut length_bytes)?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+
+    let mut event_bytes = vec![0u8; length];
+    file.read_exact(&mut event_bytes)?;
+
+    let saved_event: RecordedEvent = bincode::deserialize(&event_bytes)?;
     assert_eq!(saved_event.trace_id, event.trace_id);
+
+    // Also verify index was created
+    let index_path = temp_dir.path()
+        .join("sessions")
+        .join(&session_id)
+        .join("index.bin");
+    assert!(index_path.exists(), "Index file should exist");
 
     Ok(())
 }
