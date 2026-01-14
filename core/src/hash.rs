@@ -24,17 +24,37 @@ impl EventHasher {
             Some(recorded_event::Event::RedisCommand(cmd)) => {
                 // Redis: Command, Args
                 "redis".hash(&mut hasher);
-                cmd.command.to_uppercase().hash(&mut hasher); // Case insensitive command? Redis is case insensitive.
+                cmd.command.to_uppercase().hash(&mut hasher); // Case insensitive command
+
+                // Track if next arg is a TTL value (after EX/PX) that should be skipped
+                let mut skip_next_ttl = false;
+
                 for arg in &cmd.args {
-                    // Match the RedisValue kind
-                    // We need to implement hash for RedisValue manually or just inspect it
-                    // Since it's generated protobuf, we access fields
+                    if skip_next_ttl {
+                        skip_next_ttl = false;
+                        continue; // Skip this TTL value for hash
+                    }
+
                     if let Some(kind) = &arg.kind {
                         match kind {
                             crate::events::redis_value::Kind::Integer(i) => i.hash(&mut hasher),
-                            crate::events::redis_value::Kind::BulkString(b) => b.hash(&mut hasher),
+                            crate::events::redis_value::Kind::BulkString(b) => {
+                                // Check if this is EX or PX (TTL modifier)
+                                if let Ok(s) = std::str::from_utf8(b) {
+                                    let upper = s.to_uppercase();
+                                    if upper == "EX" || upper == "PX" || upper == "EXAT" || upper == "PXAT" {
+                                        skip_next_ttl = true;
+                                    }
+                                }
+                                b.hash(&mut hasher);
+                            }
                             crate::events::redis_value::Kind::SimpleString(s) => {
-                                s.hash(&mut hasher)
+                                // Check if this is EX or PX (TTL modifier)
+                                let upper = s.to_uppercase();
+                                if upper == "EX" || upper == "PX" || upper == "EXAT" || upper == "PXAT" {
+                                    skip_next_ttl = true;
+                                }
+                                s.hash(&mut hasher);
                             }
                             crate::events::redis_value::Kind::Error(e) => e.hash(&mut hasher),
                             _ => {} // Null/Array?

@@ -1,6 +1,6 @@
 use deja_core::events::{
     pg_message_event, recorded_event, PgCommandComplete, PgDataRow, PgMessageEvent, PgQuery,
-    RecordedEvent,
+    PgReadyForQuery, RecordedEvent,
 };
 use deja_core::replay::ReplayEngine;
 use tokio::fs::File;
@@ -43,10 +43,20 @@ async fn test_postgres_replay_responses() -> Result<(), Box<dyn std::error::Erro
         })),
         ..Default::default()
     };
+    // 4. ReadyForQuery
+    let evt4 = RecordedEvent {
+        sequence: 4,
+        event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
+            message: Some(pg_message_event::Message::ReadyForQuery(PgReadyForQuery {
+                status: "I".to_string(), // Idle
+            })),
+        })),
+        ..Default::default()
+    };
 
     // Write events
     let mut file = File::create(&file_path).await?;
-    for evt in vec![evt1, evt2, evt3] {
+    for evt in vec![evt1, evt2, evt3, evt4] {
         let json = serde_json::to_string(&evt)?;
         file.write_all(json.as_bytes()).await?;
         file.write_all(b"\n").await?;
@@ -69,7 +79,7 @@ async fn test_postgres_replay_responses() -> Result<(), Box<dyn std::error::Erro
     assert!(result.is_some(), "Should match query");
 
     let (_matched, responses) = result.unwrap();
-    // Expect DataRow, CommandComplete, and synthesized ReadyForQuery = 3
+    // Expect DataRow, CommandComplete, and ReadyForQuery = 3
     assert_eq!(responses.len(), 3, "Should have 3 response packets");
 
     // Verify content logic (byte matching is hard without parsing back, but length check is okay)

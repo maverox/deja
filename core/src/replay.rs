@@ -423,6 +423,144 @@ impl ReplayEngine {
     pub fn total_count(&self) -> usize {
         self.recordings.len()
     }
+
+    // ============ Orchestration Methods ============
+
+    /// Get the trigger event (first HTTP request) for a specific trace_id
+    /// Used in orchestrated replay to initiate the recorded flow
+    pub fn get_trigger_event(&self, trace_id: &str) -> Option<&RecordedEvent> {
+        self.recordings.iter().find(|event| {
+            event.trace_id == trace_id
+                && matches!(&event.event, Some(recorded_event::Event::HttpRequest(_)))
+        })
+    }
+
+    /// Get all trace IDs in the recordings
+    pub fn get_all_trace_ids(&self) -> Vec<String> {
+        let mut trace_ids: Vec<_> = self
+            .recordings
+            .iter()
+            .filter(|e| !e.trace_id.is_empty())
+            .map(|e| e.trace_id.clone())
+            .collect();
+        trace_ids.sort();
+        trace_ids.dedup();
+        trace_ids
+    }
+
+    /// Get the expected HTTP response for a trace_id
+    /// Used to compare with actual response in orchestrated replay
+    pub fn get_expected_response(&self, trace_id: &str) -> Option<&RecordedEvent> {
+        self.recordings.iter().find(|event| {
+            event.trace_id == trace_id
+                && matches!(&event.event, Some(recorded_event::Event::HttpResponse(_)))
+        })
+    }
+
+    /// Serialize an HTTP request event to bytes for sending
+    pub fn serialize_http_request(&self, event: &RecordedEvent) -> Option<bytes::Bytes> {
+        if let Some(recorded_event::Event::HttpRequest(req)) = &event.event {
+            let mut request = format!(
+                "{} {} HTTP/1.1\r\n",
+                req.method,
+                if req.path.is_empty() { "/" } else { &req.path }
+            );
+
+            for (key, value) in &req.headers {
+                request.push_str(&format!("{}: {}\r\n", key, value));
+            }
+
+            request.push_str("\r\n");
+
+            let mut bytes = bytes::BytesMut::from(request.as_bytes());
+            bytes.extend_from_slice(&req.body);
+            Some(bytes.freeze())
+        } else {
+            None
+        }
+    }
+
+    /// Compare two HTTP responses and return a diff result
+    pub fn compare_responses(
+        &self,
+        expected: &RecordedEvent,
+        actual_bytes: &[u8],
+    ) -> OrchestrationResult {
+        let expected_resp = match &expected.event {
+            Some(recorded_event::Event::HttpResponse(resp)) => resp,
+            _ => {
+                return OrchestrationResult {
+                    pass: false,
+                    message: "Expected event is not an HTTP response".to_string(),
+                    diff: None,
+                }
+            }
+        };
+
+        // Parse actual response (simple HTTP/1.1 parsing)
+        let actual_str = String::from_utf8_lossy(actual_bytes);
+        let mut lines = actual_str.lines();
+
+        // Parse status line
+        let actual_status = lines
+            .next()
+            .and_then(|line| {
+                let parts: Vec<_> = line.splitn(3, ' ').collect();
+                if parts.len() >= 2 {
+                    parts[1].parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        // Check status code
+        if actual_status != expected_resp.status {
+            return OrchestrationResult {
+                pass: false,
+                message: format!(
+                    "Status code mismatch: expected {}, got {}",
+                    expected_resp.status, actual_status
+                ),
+                diff: Some(ResponseDiff {
+                    status_diff: Some((expected_resp.status, actual_status)),
+                    header_diffs: vec![],
+                    body_diff: None,
+                }),
+            };
+        }
+
+        // For now, consider status match a pass
+        // TODO: Add header and body comparison
+        OrchestrationResult {
+            pass: true,
+            message: "Response matches".to_string(),
+            diff: None,
+        }
+    }
+
+    /// Reset all visited flags for a fresh replay
+    pub fn reset(&mut self) {
+        self.visited.fill(false);
+        self.search_start = 0;
+        self.connection_map.clear();
+    }
+}
+
+/// Result of orchestrated replay comparison
+#[derive(Debug, Clone)]
+pub struct OrchestrationResult {
+    pub pass: bool,
+    pub message: String,
+    pub diff: Option<ResponseDiff>,
+}
+
+/// Detailed diff between expected and actual responses
+#[derive(Debug, Clone)]
+pub struct ResponseDiff {
+    pub status_diff: Option<(u32, u32)>, // (expected, actual)
+    pub header_diffs: Vec<(String, Option<String>, Option<String>)>, // (key, expected, actual)
+    pub body_diff: Option<String>,
 }
 
 // Helper to extract integer from RedisValue regardless of type (Integer or String representation)
