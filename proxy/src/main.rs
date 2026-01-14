@@ -1,3 +1,5 @@
+mod control_api;
+
 use clap::Parser;
 use deja_core::protocols::http::HttpParser;
 use deja_core::protocols::postgres::PostgresParser;
@@ -27,6 +29,11 @@ struct Args {
     /// Can also use DEJA_MODE env var
     #[arg(long, default_value = "record")]
     mode: String,
+
+    /// Control API port for SDK communication
+    /// Can also use DEJA_CONTROL_PORT env var
+    #[arg(long, default_value = "9999")]
+    control_port: u16,
 }
 
 #[tokio::main]
@@ -75,6 +82,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+
+    // Start Control API for SDK communication
+    let control_port = std::env::var("DEJA_CONTROL_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(args.control_port);
+
+    let control_state = Arc::new(control_api::ControlApiState {
+        recorder: recorder.clone(),
+        replay_engine: replay_engine.clone(),
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = control_api::start_control_api(control_port, control_state).await {
+            eprintln!("[ControlAPI] Error: {}", e);
+        }
+    });
 
     let parsers: Vec<Arc<dyn ProtocolParser>> = vec![
         Arc::new(HttpParser),

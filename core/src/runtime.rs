@@ -104,9 +104,25 @@ impl DejaRuntime for ProductionRuntime {
 
 /// Network runtime - communicates with Deja proxy for recording/replay
 pub struct NetworkRuntime {
+    client: reqwest::Client,
     proxy_url: String,
     trace_id: Arc<RwLock<String>>,
     mode: String,
+}
+
+/// Request body for /capture endpoint
+#[derive(serde::Serialize)]
+struct CaptureRequest {
+    trace_id: String,
+    kind: String,
+    value: String,
+}
+
+/// Response from /replay endpoint
+#[derive(serde::Deserialize)]
+struct ReplayResponse {
+    value: String,
+    found: bool,
 }
 
 impl NetworkRuntime {
@@ -117,6 +133,7 @@ impl NetworkRuntime {
     /// - DEJA_MODE (default: production)
     pub fn from_env() -> Self {
         Self {
+            client: reqwest::Client::new(),
             proxy_url: env::var("DEJA_PROXY_URL").unwrap_or_else(|_| "http://localhost:9999".into()),
             trace_id: Arc::new(RwLock::new(String::new())),
             mode: env::var("DEJA_MODE").unwrap_or_else(|_| "production".into()),
@@ -126,6 +143,7 @@ impl NetworkRuntime {
     /// Create with specific configuration
     pub fn new(proxy_url: String, mode: String) -> Self {
         Self {
+            client: reqwest::Client::new(),
             proxy_url,
             trace_id: Arc::new(RwLock::new(String::new())),
             mode,
@@ -145,6 +163,7 @@ impl NetworkRuntime {
     /// Create a clone with a specific trace ID
     pub fn with_trace(&self, trace_id: String) -> Self {
         Self {
+            client: self.client.clone(),
             proxy_url: self.proxy_url.clone(),
             trace_id: Arc::new(RwLock::new(trace_id)),
             mode: self.mode.clone(),
@@ -160,6 +179,39 @@ impl NetworkRuntime {
     pub fn is_replaying(&self) -> bool {
         self.mode == "replay"
     }
+
+    /// POST a captured value to the proxy
+    async fn capture(&self, kind: &str, value: &str) {
+        let trace = self.trace_id();
+        let req = CaptureRequest {
+            trace_id: trace,
+            kind: kind.to_string(),
+            value: value.to_string(),
+        };
+        let _ = self.client
+            .post(format!("{}/capture", self.proxy_url))
+            .json(&req)
+            .send()
+            .await;
+    }
+
+    /// GET a replayed value from the proxy
+    async fn replay(&self, kind: &str) -> Option<String> {
+        let trace = self.trace_id();
+        let resp = self.client
+            .get(format!("{}/replay", self.proxy_url))
+            .query(&[("trace_id", &trace), ("kind", &kind.to_string())])
+            .send()
+            .await
+            .ok()?;
+
+        let replay_resp: ReplayResponse = resp.json().await.ok()?;
+        if replay_resp.found {
+            Some(replay_resp.value)
+        } else {
+            None
+        }
+    }
 }
 
 #[async_trait]
@@ -168,15 +220,16 @@ impl DejaRuntime for NetworkRuntime {
         match self.mode.as_str() {
             "record" => {
                 let id = Uuid::new_v4();
-                // In a full implementation, POST to proxy to record
-                // For now, just generate and return
-                // TODO: Integrate with proxy /capture endpoint
+                self.capture("uuid", &id.to_string()).await;
                 id
             }
             "replay" => {
-                // In a full implementation, GET from proxy
-                // For now, fallback to generating
-                // TODO: Integrate with proxy /replay endpoint
+                if let Some(val) = self.replay("uuid").await {
+                    if let Ok(id) = Uuid::parse_str(&val) {
+                        return id;
+                    }
+                }
+                // Fallback - generate fresh (breaks determinism but allows forward progress)
                 Uuid::new_v4()
             }
             _ => Uuid::new_v4(),
@@ -185,8 +238,17 @@ impl DejaRuntime for NetworkRuntime {
 
     async fn uuid_v7(&self) -> Uuid {
         match self.mode.as_str() {
-            "record" | "replay" => {
-                // TODO: Integrate with proxy
+            "record" => {
+                let id = Uuid::now_v7();
+                self.capture("uuid", &id.to_string()).await;
+                id
+            }
+            "replay" => {
+                if let Some(val) = self.replay("uuid").await {
+                    if let Ok(id) = Uuid::parse_str(&val) {
+                        return id;
+                    }
+                }
                 Uuid::now_v7()
             }
             _ => Uuid::now_v7(),
@@ -195,8 +257,20 @@ impl DejaRuntime for NetworkRuntime {
 
     async fn now(&self) -> SystemTime {
         match self.mode.as_str() {
-            "record" | "replay" => {
-                // TODO: Integrate with proxy
+            "record" => {
+                let now = SystemTime::now();
+                let ns = now.duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                self.capture("time", &ns.to_string()).await;
+                now
+            }
+            "replay" => {
+                if let Some(val) = self.replay("time").await {
+                    if let Ok(ns) = val.parse::<u64>() {
+                        return SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns);
+                    }
+                }
                 SystemTime::now()
             }
             _ => SystemTime::now(),
@@ -204,16 +278,25 @@ impl DejaRuntime for NetworkRuntime {
     }
 
     async fn now_millis(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
+        let time = self.now().await;
+        time.duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
     }
 
     async fn random_u64(&self) -> u64 {
         match self.mode.as_str() {
-            "record" | "replay" => {
-                // TODO: Integrate with proxy
+            "record" => {
+                let val: u64 = rand::random();
+                self.capture("random", &val.to_string()).await;
+                val
+            }
+            "replay" => {
+                if let Some(val) = self.replay("random").await {
+                    if let Ok(v) = val.parse::<u64>() {
+                        return v;
+                    }
+                }
                 rand::random()
             }
             _ => rand::random(),

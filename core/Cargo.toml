@@ -27,6 +27,9 @@ rcgen = "0.13"
 rustls-pemfile = "2.1"
 tokio-rustls = "0.26"
 
+# HTTP client for NetworkRuntime
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 [build-dependencies]
 prost-build = "0.12"
 
