@@ -18,6 +18,8 @@ hyper = { version = "1.4", features = ["full", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 url = "2.5"
+tokio-rustls = "0.26"
+rustls = "0.23"
 
 [dependencies.deja-core]
 path = "../core"

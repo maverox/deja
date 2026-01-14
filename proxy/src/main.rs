@@ -34,6 +34,16 @@ struct Args {
     /// Can also use DEJA_CONTROL_PORT env var
     #[arg(long, default_value = "9999")]
     control_port: u16,
+
+    /// Path to CA certificate for TLS MITM (PEM format)
+    /// Can also use DEJA_CA_CERT env var
+    #[arg(long)]
+    ca_cert: Option<String>,
+
+    /// Path to CA private key for TLS MITM (PEM format)
+    /// Can also use DEJA_CA_KEY env var
+    #[arg(long)]
+    ca_key: Option<String>,
 }
 
 #[tokio::main]
@@ -100,6 +110,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Initialize TLS MITM if CA cert/key provided
+    let tls_manager = {
+        let ca_cert_path = args.ca_cert.clone()
+            .or_else(|| std::env::var("DEJA_CA_CERT").ok());
+        let ca_key_path = args.ca_key.clone()
+            .or_else(|| std::env::var("DEJA_CA_KEY").ok());
+
+        match (ca_cert_path, ca_key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                match (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path)) {
+                    (Ok(cert_pem), Ok(key_pem)) => {
+                        match deja_core::tls_mitm::TlsMitmManager::new(&cert_pem, &key_pem) {
+                            Ok(manager) => {
+                                println!("[TLS] MITM manager initialized with CA from {}", cert_path);
+                                Some(Arc::new(manager))
+                            }
+                            Err(e) => {
+                                eprintln!("[TLS] Failed to initialize MITM manager: {}", e);
+                                None
+                            }
+                        }
+                    }
+                    (Err(e), _) => {
+                        eprintln!("[TLS] Failed to read CA cert: {}", e);
+                        None
+                    }
+                    (_, Err(e)) => {
+                        eprintln!("[TLS] Failed to read CA key: {}", e);
+                        None
+                    }
+                }
+            }
+            _ => {
+                println!("[TLS] No CA cert/key provided, TLS MITM disabled");
+                None
+            }
+        }
+    };
+
     let parsers: Vec<Arc<dyn ProtocolParser>> = vec![
         Arc::new(HttpParser),
         Arc::new(PostgresParser),
@@ -133,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let recorder_clone = recorder.clone();
         let replay_engine_clone = replay_engine.clone();
         let parsers_clone = parsers_arc.clone();
+        let _tls_manager_clone = tls_manager.clone(); // Available for TLS MITM when needed
 
         // Task for this listener
         tasks.push(tokio::spawn(async move {
