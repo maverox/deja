@@ -44,8 +44,44 @@ pub trait DejaRuntime: Send + Sync {
     /// Generate random bytes
     async fn random_bytes(&self, len: usize) -> Vec<u8>;
 
-    /// Generate a nanoid
+    /// Generate a nanoid (default 21 chars, alphanumeric)
     async fn nanoid(&self) -> String;
+
+    // ========== Generic Capture/Replay Interface ==========
+    // These methods allow clients to record ANY non-deterministic value
+    // without requiring core to enumerate all possible types.
+
+    /// Record a non-deterministic value with a tag.
+    /// In production mode: no-op (value is ignored)
+    /// In recording mode: sends value to proxy for storage
+    async fn capture(&self, tag: &str, value: &str);
+
+    /// Replay a recorded value by tag.
+    /// In production mode: returns None
+    /// In replay mode: returns the recorded value
+    async fn replay(&self, tag: &str) -> Option<String>;
+}
+
+/// Helper function for deterministic execution with any runtime.
+/// This is separate from the trait because generic functions aren't dyn-compatible.
+///
+/// Usage:
+/// ```ignore
+/// let id = deterministic(&runtime, "payment_id", || nanoid!(20, &ALPHABET)).await;
+/// ```
+pub async fn deterministic<R, F>(runtime: &R, tag: &str, generator: F) -> String
+where
+    R: DejaRuntime + ?Sized,
+    F: FnOnce() -> String + Send,
+{
+    // Try replay first
+    if let Some(value) = runtime.replay(tag).await {
+        return value;
+    }
+    // Generate and capture
+    let value = generator();
+    runtime.capture(tag, &value).await;
+    value
 }
 
 /// Trait for async boundary operations (task spawning)
@@ -142,6 +178,15 @@ impl DejaRuntime for ProductionRuntime {
             .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
             .collect()
     }
+
+    async fn capture(&self, _tag: &str, _value: &str) {
+        // Production mode: no-op
+    }
+
+    async fn replay(&self, _tag: &str) -> Option<String> {
+        // Production mode: always return None (use generator)
+        None
+    }
 }
 
 /// Network runtime - communicates with Deja proxy for recording/replay
@@ -226,8 +271,8 @@ impl NetworkRuntime {
         self.mode == "replay"
     }
 
-    /// POST a captured value to the proxy
-    async fn capture(&self, kind: &str, value: &str) {
+    /// POST a captured value to the proxy (internal use)
+    async fn capture_internal(&self, kind: &str, value: &str) {
         let trace = self.trace_id();
         let req = CaptureRequest {
             trace_id: trace,
@@ -241,8 +286,8 @@ impl NetworkRuntime {
             .await;
     }
 
-    /// GET a replayed value from the proxy
-    async fn replay(&self, kind: &str) -> Option<String> {
+    /// GET a replayed value from the proxy (internal use)
+    async fn replay_internal(&self, kind: &str) -> Option<String> {
         let trace = self.trace_id();
         let resp = self.client
             .get(format!("{}/replay", self.proxy_url))
@@ -266,11 +311,11 @@ impl DejaRuntime for NetworkRuntime {
         match self.mode.as_str() {
             "record" => {
                 let id = Uuid::new_v4();
-                self.capture("uuid", &id.to_string()).await;
+                self.capture_internal("uuid", &id.to_string()).await;
                 id
             }
             "replay" => {
-                if let Some(val) = self.replay("uuid").await {
+                if let Some(val) = self.replay_internal("uuid").await {
                     if let Ok(id) = Uuid::parse_str(&val) {
                         return id;
                     }
@@ -286,11 +331,11 @@ impl DejaRuntime for NetworkRuntime {
         match self.mode.as_str() {
             "record" => {
                 let id = Uuid::now_v7();
-                self.capture("uuid", &id.to_string()).await;
+                self.capture_internal("uuid", &id.to_string()).await;
                 id
             }
             "replay" => {
-                if let Some(val) = self.replay("uuid").await {
+                if let Some(val) = self.replay_internal("uuid").await {
                     if let Ok(id) = Uuid::parse_str(&val) {
                         return id;
                     }
@@ -308,11 +353,11 @@ impl DejaRuntime for NetworkRuntime {
                 let ns = now.duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
-                self.capture("time", &ns.to_string()).await;
+                self.capture_internal("time", &ns.to_string()).await;
                 now
             }
             "replay" => {
-                if let Some(val) = self.replay("time").await {
+                if let Some(val) = self.replay_internal("time").await {
                     if let Ok(ns) = val.parse::<u64>() {
                         return SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns);
                     }
@@ -334,11 +379,11 @@ impl DejaRuntime for NetworkRuntime {
         match self.mode.as_str() {
             "record" => {
                 let val: u64 = rand::random();
-                self.capture("random", &val.to_string()).await;
+                self.capture_internal("random", &val.to_string()).await;
                 val
             }
             "replay" => {
-                if let Some(val) = self.replay("random").await {
+                if let Some(val) = self.replay_internal("random").await {
                     if let Ok(v) = val.parse::<u64>() {
                         return v;
                     }
@@ -363,6 +408,25 @@ impl DejaRuntime for NetworkRuntime {
         (0..21)
             .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
             .collect()
+    }
+
+    // Public trait methods for generic capture/replay
+    // Note: These delegate to the private methods with same names via fully qualified syntax
+    async fn capture(&self, tag: &str, value: &str) {
+        // Only capture in record mode
+        if self.mode == "record" {
+            // Use private capture method
+            self.capture_internal(tag, value).await;
+        }
+    }
+
+    async fn replay(&self, tag: &str) -> Option<String> {
+        // Only replay in replay mode
+        if self.mode == "replay" {
+            self.replay_internal(tag).await
+        } else {
+            None
+        }
     }
 }
 
@@ -433,6 +497,15 @@ pub fn get_runtime() -> Box<dyn DejaRuntime> {
     match mode.as_str() {
         "record" | "replay" => Box::new(NetworkRuntime::from_env()),
         _ => Box::new(ProductionRuntime::new()),
+    }
+}
+
+/// Get the appropriate runtime as Arc for shared ownership
+pub fn get_runtime_arc() -> Arc<dyn DejaRuntime> {
+    let mode = env::var("DEJA_MODE").unwrap_or_else(|_| "production".into());
+    match mode.as_str() {
+        "record" | "replay" => Arc::new(NetworkRuntime::from_env()),
+        _ => Arc::new(ProductionRuntime::new()),
     }
 }
 
