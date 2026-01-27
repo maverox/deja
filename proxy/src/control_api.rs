@@ -1,13 +1,19 @@
-//! Control API for NetworkRuntime communication
+//! Control API for NetworkRuntime communication and Trace Correlation
 //!
-//! Provides HTTP endpoints for the SDK to record and replay non-deterministic values:
+//! Provides HTTP endpoints for the SDK to:
 //! - POST /capture - Record a value (uuid, time, random, etc.)
 //! - GET /replay - Retrieve a recorded value by trace_id and kind
 //! - POST /orchestrate - Trigger orchestrated replay for a specific trace
 //! - GET /traces - List all available trace IDs
+//! - POST /control/trace - Trace lifecycle events (start/end)
+//! - POST /control/connection - Connection association/update events
 
+use crate::correlation::TraceCorrelator;
 use bytes::Bytes;
-use deja_core::events::{non_deterministic_event, recorded_event, NonDeterministicEvent, RecordedEvent};
+use deja_core::control_api::ControlMessage;
+use deja_core::events::{
+    non_deterministic_event, recorded_event, NonDeterministicEvent, RecordedEvent,
+};
 use deja_core::recording::Recorder;
 use deja_core::replay::ReplayEngine;
 use http_body_util::{BodyExt, Full};
@@ -24,7 +30,7 @@ use tokio::sync::Mutex;
 #[derive(Debug, Deserialize)]
 pub struct CaptureRequest {
     pub trace_id: String,
-    pub kind: String,  // "uuid", "time", "random", "task_spawn", etc.
+    pub kind: String, // "uuid", "time", "random", "task_spawn", etc.
     pub value: String,
 }
 
@@ -62,6 +68,7 @@ pub struct TracesResponse {
 pub struct ControlApiState {
     pub recorder: Option<Arc<Recorder>>,
     pub replay_engine: Option<Arc<Mutex<ReplayEngine>>>,
+    pub correlator: Arc<TraceCorrelator>,
 }
 
 /// Start the control API server
@@ -103,6 +110,8 @@ async fn handle_request(
         (&Method::GET, "/replay") => handle_replay(req, state).await,
         (&Method::POST, "/orchestrate") => handle_orchestrate(req, state).await,
         (&Method::GET, "/traces") => handle_list_traces(state).await,
+        (&Method::POST, "/control/trace") => handle_control_trace(req, state).await,
+        (&Method::POST, "/control/connection") => handle_control_connection(req, state).await,
         (&Method::GET, "/health") => Ok(Response::new(Full::new(Bytes::from("ok")))),
         _ => {
             let mut response = Response::new(Full::new(Bytes::from("Not Found")));
@@ -121,7 +130,8 @@ async fn handle_capture(
     let capture_req: CaptureRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
-            let mut response = Response::new(Full::new(Bytes::from(format!("Invalid JSON: {}", e))));
+            let mut response =
+                Response::new(Full::new(Bytes::from(format!("Invalid JSON: {}", e))));
             *response.status_mut() = StatusCode::BAD_REQUEST;
             return Ok(response);
         }
@@ -129,7 +139,18 @@ async fn handle_capture(
 
     // Record if we have a recorder
     if let Some(recorder) = &state.recorder {
-        let event = create_non_deterministic_event(&capture_req);
+        let event = match create_non_deterministic_event(&capture_req) {
+            Ok(e) => e,
+            Err(e) => {
+                let mut response = Response::new(Full::new(Bytes::from(format!(
+                    "Invalid capture value: {}",
+                    e
+                ))));
+                *response.status_mut() = StatusCode::BAD_REQUEST;
+                return Ok(response);
+            }
+        };
+
         if let Err(e) = recorder.save_event(&event).await {
             eprintln!("[ControlAPI] Failed to save event: {}", e);
         }
@@ -164,15 +185,35 @@ async fn handle_replay(
         };
 
         match value {
-            Some(v) => ReplayResponse { value: v, found: true },
-            None => ReplayResponse { value: String::new(), found: false },
+            Some(v) => ReplayResponse {
+                value: v,
+                found: true,
+            },
+            None => ReplayResponse {
+                value: String::new(),
+                found: false,
+            },
         }
     } else {
-        ReplayResponse { value: String::new(), found: false }
+        ReplayResponse {
+            value: String::new(),
+            found: false,
+        }
     };
 
-    let json = serde_json::to_string(&response).unwrap_or_else(|_| r#"{"found":false}"#.to_string());
-    Ok(Response::new(Full::new(Bytes::from(json))))
+    let json = serde_json::to_string(&response).map_err(|e| {
+        eprintln!("Serialization error in handle_replay: {}", e);
+        e
+    });
+
+    match json {
+        Ok(j) => Ok(Response::new(Full::new(Bytes::from(j)))),
+        Err(_) => {
+            let mut resp = Response::new(Full::new(Bytes::from("Internal Server Error")));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            Ok(resp)
+        }
+    }
 }
 
 async fn handle_orchestrate(
@@ -184,13 +225,17 @@ async fn handle_orchestrate(
     let orch_req: OrchestrateRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
-            let mut response = Response::new(Full::new(Bytes::from(format!("Invalid JSON: {}", e))));
+            let mut response =
+                Response::new(Full::new(Bytes::from(format!("Invalid JSON: {}", e))));
             *response.status_mut() = StatusCode::BAD_REQUEST;
             return Ok(response);
         }
     };
 
-    println!("[Orchestrate] Starting replay for trace: {}", orch_req.trace_id);
+    println!(
+        "[Orchestrate] Starting replay for trace: {}",
+        orch_req.trace_id
+    );
 
     // Get the trigger event and expected response from replay engine
     let Some(engine_lock) = &state.replay_engine else {
@@ -200,7 +245,7 @@ async fn handle_orchestrate(
             message: "No replay engine available (not in replay/orchestrated mode)".to_string(),
             status_diff: None,
         };
-        let json = serde_json::to_string(&response).unwrap();
+        let json = serde_json::to_string(&response).unwrap_or_default();
         return Ok(Response::new(Full::new(Bytes::from(json))));
     };
 
@@ -216,7 +261,7 @@ async fn handle_orchestrate(
                 message: "No trigger event found for trace".to_string(),
                 status_diff: None,
             };
-            let json = serde_json::to_string(&response).unwrap();
+            let json = serde_json::to_string(&response).unwrap_or_default();
             return Ok(Response::new(Full::new(Bytes::from(json))));
         }
     };
@@ -231,7 +276,7 @@ async fn handle_orchestrate(
                 message: "No expected response found for trace".to_string(),
                 status_diff: None,
             };
-            let json = serde_json::to_string(&response).unwrap();
+            let json = serde_json::to_string(&response).unwrap_or_default();
             return Ok(Response::new(Full::new(Bytes::from(json))));
         }
     };
@@ -246,7 +291,7 @@ async fn handle_orchestrate(
                 message: "Failed to serialize trigger request".to_string(),
                 status_diff: None,
             };
-            let json = serde_json::to_string(&response).unwrap();
+            let json = serde_json::to_string(&response).unwrap_or_default();
             return Ok(Response::new(Full::new(Bytes::from(json))));
         }
     };
@@ -266,7 +311,7 @@ async fn handle_orchestrate(
                 message: "Trigger is not an HTTP request".to_string(),
                 status_diff: None,
             };
-            let json = serde_json::to_string(&response).unwrap();
+            let json = serde_json::to_string(&response).unwrap_or_default();
             return Ok(Response::new(Full::new(Bytes::from(json))));
         }
     };
@@ -289,7 +334,7 @@ async fn handle_orchestrate(
                 message: format!("Invalid service URL: {}", e),
                 status_diff: None,
             };
-            let json = serde_json::to_string(&response).unwrap();
+            let json = serde_json::to_string(&response).unwrap_or_default();
             return Ok(Response::new(Full::new(Bytes::from(json))));
         }
     };
@@ -308,7 +353,7 @@ async fn handle_orchestrate(
                 message: format!("Failed to connect to service: {}", e),
                 status_diff: None,
             };
-            let json = serde_json::to_string(&response).unwrap();
+            let json = serde_json::to_string(&response).unwrap_or_default();
             return Ok(Response::new(Full::new(Bytes::from(json))));
         }
     };
@@ -323,7 +368,7 @@ async fn handle_orchestrate(
             message: format!("Failed to send request: {}", e),
             status_diff: None,
         };
-        let json = serde_json::to_string(&response).unwrap();
+        let json = serde_json::to_string(&response).unwrap_or_default();
         return Ok(Response::new(Full::new(Bytes::from(json))));
     }
 
@@ -338,7 +383,7 @@ async fn handle_orchestrate(
                 message: format!("Failed to read response: {}", e),
                 status_diff: None,
             };
-            let json = serde_json::to_string(&response).unwrap();
+            let json = serde_json::to_string(&response).unwrap_or_default();
             return Ok(Response::new(Full::new(Bytes::from(json))));
         }
     };
@@ -356,7 +401,7 @@ async fn handle_orchestrate(
         status_diff: result.diff.and_then(|d| d.status_diff),
     };
 
-    let json = serde_json::to_string(&orch_response).unwrap();
+    let json = serde_json::to_string(&orch_response).unwrap_or_default();
     Ok(Response::new(Full::new(Bytes::from(json))))
 }
 
@@ -372,25 +417,150 @@ async fn handle_list_traces(
         TracesResponse { traces: vec![] }
     };
 
-    let json = serde_json::to_string(&response).unwrap_or_else(|_| r#"{"traces":[]}"#.to_string());
-    Ok(Response::new(Full::new(Bytes::from(json))))
+    let json = serde_json::to_string(&response).map_err(|e| {
+        eprintln!("Serialization error in handle_list_traces: {}", e);
+        e
+    });
+
+    match json {
+        Ok(j) => Ok(Response::new(Full::new(Bytes::from(j)))),
+        Err(_) => {
+            let mut resp = Response::new(Full::new(Bytes::from("Internal Server Error")));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            Ok(resp)
+        }
+    }
 }
 
-fn create_non_deterministic_event(req: &CaptureRequest) -> RecordedEvent {
+/// Handle trace lifecycle events (start/end)
+async fn handle_control_trace(
+    req: Request<Incoming>,
+    state: Arc<ControlApiState>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Read body
+    let body = req.collect().await?.to_bytes();
+    let message: ControlMessage = match serde_json::from_slice(&body) {
+        Ok(msg) => msg,
+        Err(e) => {
+            let response = create_control_error_response(&format!("Invalid JSON: {}", e));
+            return Ok(Response::new(Full::new(Bytes::from(response))));
+        }
+    };
+
+    // Process the message
+    let response_body = match message {
+        ControlMessage::StartTrace {
+            trace_id,
+            timestamp_ns,
+        } => {
+            println!("[Correlation] Starting trace: {}", trace_id);
+            state.correlator.start_trace(trace_id, timestamp_ns).await;
+            create_control_success_response()
+        }
+        ControlMessage::EndTrace {
+            trace_id,
+            timestamp_ns,
+        } => {
+            println!("[Correlation] Ending trace: {}", trace_id);
+            state.correlator.end_trace(trace_id, timestamp_ns).await;
+            create_control_success_response()
+        }
+        _ => create_control_error_response("Invalid message type for /control/trace"),
+    };
+
+    Ok(Response::new(Full::new(Bytes::from(response_body))))
+}
+
+/// Handle connection lifecycle events (associate/update)
+async fn handle_control_connection(
+    req: Request<Incoming>,
+    state: Arc<ControlApiState>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Read body
+    let body = req.collect().await?.to_bytes();
+    let message: ControlMessage = match serde_json::from_slice(&body) {
+        Ok(msg) => msg,
+        Err(e) => {
+            let response = create_control_error_response(&format!("Invalid JSON: {}", e));
+            return Ok(Response::new(Full::new(Bytes::from(response))));
+        }
+    };
+
+    // Process the message
+    let response_body = match message {
+        ControlMessage::AssociateConnection {
+            trace_id,
+            connection_id,
+            ..
+        } => {
+            println!(
+                "[Correlation] Associating connection {} with trace {}",
+                connection_id, trace_id
+            );
+            state
+                .correlator
+                .associate_connection(connection_id, trace_id)
+                .await;
+            create_control_success_response()
+        }
+        ControlMessage::UpdateConnection {
+            connection_id,
+            new_trace_id,
+            ..
+        } => {
+            println!(
+                "[Correlation] Updating connection {} to trace {}",
+                connection_id, new_trace_id
+            );
+            state
+                .correlator
+                .update_connection(connection_id, new_trace_id)
+                .await;
+            create_control_success_response()
+        }
+        _ => create_control_error_response("Invalid message type for /control/connection"),
+    };
+
+    Ok(Response::new(Full::new(Bytes::from(response_body))))
+}
+
+/// Create a successful control API response
+fn create_control_success_response() -> String {
+    r#"{"success":true}"#.to_string()
+}
+
+/// Create an error control API response
+fn create_control_error_response(message: &str) -> String {
+    serde_json::json!({
+        "success": false,
+        "message": message
+    })
+    .to_string()
+}
+
+fn create_non_deterministic_event(req: &CaptureRequest) -> Result<RecordedEvent, String> {
     let kind = match req.kind.as_str() {
-        "uuid" => Some(non_deterministic_event::Kind::UuidCapture(req.value.clone())),
+        "uuid" => Some(non_deterministic_event::Kind::UuidCapture(
+            req.value.clone(),
+        )),
         "time" => {
-            let ns: u64 = req.value.parse().unwrap_or(0);
+            let ns: u64 = req
+                .value
+                .parse()
+                .map_err(|_| format!("Invalid timestamp: {}", req.value))?;
             Some(non_deterministic_event::Kind::TimeCaptureNs(ns))
         }
         "random" => {
-            let seed: u64 = req.value.parse().unwrap_or(0);
+            let seed: u64 = req
+                .value
+                .parse()
+                .map_err(|_| format!("Invalid seed: {}", req.value))?;
             Some(non_deterministic_event::Kind::RandomSeedCapture(seed))
         }
         _ => None,
     };
 
-    RecordedEvent {
+    Ok(RecordedEvent {
         trace_id: req.trace_id.clone(),
         span_id: uuid::Uuid::new_v4().to_string(),
         parent_span_id: None,
@@ -404,5 +574,5 @@ fn create_non_deterministic_event(req: &CaptureRequest) -> RecordedEvent {
         event: kind.map(|k| {
             recorded_event::Event::NonDeterministic(NonDeterministicEvent { kind: Some(k) })
         }),
-    }
+    })
 }

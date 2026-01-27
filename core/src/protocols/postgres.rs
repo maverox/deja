@@ -84,7 +84,7 @@ impl PostgresConnectionParser {
 
         // Parse Params: null terminated key/value pairs
         let mut params = std::collections::HashMap::new();
-        let body_len = if len >= 8 { len - 8 } else { 0 };
+        let body_len = len.saturating_sub(8);
         let mut body = buf.split_to(body_len);
 
         while body.has_remaining() {
@@ -420,7 +420,7 @@ impl ConnectionParser for PostgresConnectionParser {
                 }
                 b'Z' => {
                     // ReadyForQuery
-                    if body.len() >= 1 {
+                    if !body.is_empty() {
                         let status = (body.get_u8() as char).to_string();
                         events.push(RecordedEvent {
                             trace_id: uuid::Uuid::new_v4().to_string(),

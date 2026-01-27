@@ -44,6 +44,7 @@ enum Protocol {
     Postgres,
     Redis,
     Http,
+    Grpc,
 }
 
 impl ReplayEngine {
@@ -144,6 +145,7 @@ impl ReplayEngine {
             },
             Some(recorded_event::Event::RedisResponse(_)) => true,
             Some(recorded_event::Event::HttpResponse(_)) => true,
+            Some(recorded_event::Event::GrpcResponse(_)) => true,
             _ => false,
         }
     }
@@ -155,6 +157,8 @@ impl ReplayEngine {
             | Some(recorded_event::Event::RedisResponse(_)) => Some(Protocol::Redis),
             Some(recorded_event::Event::HttpRequest(_))
             | Some(recorded_event::Event::HttpResponse(_)) => Some(Protocol::Http),
+            Some(recorded_event::Event::GrpcRequest(_))
+            | Some(recorded_event::Event::GrpcResponse(_)) => Some(Protocol::Grpc),
             _ => None,
         }
     }
@@ -173,6 +177,9 @@ impl ReplayEngine {
             }
             Some(inner @ recorded_event::Event::HttpResponse(_)) => {
                 crate::protocols::http::HttpSerializer::serialize_message(inner)
+            }
+            Some(inner @ recorded_event::Event::GrpcResponse(_)) => {
+                crate::protocols::grpc::GrpcSerializer::serialize_message(inner)
             }
             _ => None,
         }
@@ -352,6 +359,23 @@ impl ReplayEngine {
                 ) => true,
                 _ => false,
             },
+            (
+                Some(recorded_event::Event::GrpcRequest(inc_req)),
+                Some(recorded_event::Event::GrpcRequest(rec_req)),
+            ) => {
+                // Match gRPC requests by service, method, and request body
+                if inc_req.service != rec_req.service {
+                    return false;
+                }
+                if inc_req.method != rec_req.method {
+                    return false;
+                }
+                // For strict matching, compare request bodies
+                if inc_req.request_body != rec_req.request_body {
+                    return false;
+                }
+                true
+            }
 
             _ => false,
         }
@@ -626,7 +650,7 @@ pub async fn load_recordings(
                         }
                     } else {
                         // Legacy flat files check
-                        if entry_path.extension().map_or(false, |ext| ext == "jsonl") {
+                        if entry_path.extension().is_some_and(|ext| ext == "jsonl") {
                             println!("Loading legacy flat file: {:?}", entry_path);
                             load_jsonl_file(&entry_path, &mut recordings).await?;
                         }

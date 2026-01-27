@@ -21,6 +21,15 @@ impl EventHasher {
                 req.path.hash(&mut hasher);
                 req.body.hash(&mut hasher);
             }
+            Some(recorded_event::Event::GrpcRequest(req)) => {
+                // gRPC: Service, Method, Request Body
+                // Hash = hash(service + method + request_body)
+                // Ignore metadata for stability (similar to HTTP headers)
+                "grpc".hash(&mut hasher);
+                req.service.hash(&mut hasher);
+                req.method.hash(&mut hasher);
+                req.request_body.hash(&mut hasher);
+            }
             Some(recorded_event::Event::RedisCommand(cmd)) => {
                 // Redis: Command, Args
                 "redis".hash(&mut hasher);

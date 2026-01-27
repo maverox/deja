@@ -354,7 +354,7 @@ impl ConnectionParser for RedisConnectionParser {
                         if !arr.values.is_empty() {
                             // Extract command name
                             let cmd_name = if let Some(Some(redis_value::Kind::BulkString(bs))) =
-                                arr.values.get(0).map(|v| &v.kind)
+                                arr.values.first().map(|v| &v.kind)
                             {
                                 String::from_utf8_lossy(bs).to_string()
                             } else {
@@ -460,11 +460,7 @@ impl RedisSerializer {
     pub fn serialize_message(event: &crate::events::recorded_event::Event) -> Option<Bytes> {
         match event {
             crate::events::recorded_event::Event::RedisResponse(resp) => {
-                if let Some(val) = &resp.value {
-                    Some(Self::serialize_value(val))
-                } else {
-                    None
-                }
+                resp.value.as_ref().map(|val| Self::serialize_value(val))
             }
             _ => None,
         }

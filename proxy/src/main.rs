@@ -1,6 +1,8 @@
 mod control_api;
+mod correlation;
 
 use clap::Parser;
+use deja_core::protocols::grpc::GrpcParser;
 use deja_core::protocols::http::HttpParser;
 use deja_core::protocols::postgres::PostgresParser;
 use deja_core::protocols::redis::RedisParser;
@@ -60,7 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("DEJA_MODE").unwrap_or_else(|_| args.mode.clone())
     };
 
-    let record_dir = std::env::var("DEJA_RECORDING_PATH").unwrap_or_else(|_| args.record_dir.clone());
+    let record_dir =
+        std::env::var("DEJA_RECORDING_PATH").unwrap_or_else(|_| args.record_dir.clone());
 
     let mut maps = args.maps.clone();
     if maps.is_empty() {
@@ -89,11 +92,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ReplayMode::FullMock | ReplayMode::Orchestrated => {
             println!("Loading replay engine from {}", record_dir);
             let engine = ReplayEngine::new(&record_dir).await?;
-            println!("Loaded {} recordings, {} remaining", engine.total_count(), engine.remaining_count());
+            println!(
+                "Loaded {} recordings, {} remaining",
+                engine.total_count(),
+                engine.remaining_count()
+            );
             Some(Arc::new(tokio::sync::Mutex::new(engine)))
         }
         _ => None,
     };
+
+    // Initialize trace correlator for connection tracking
+    let correlator = Arc::new(correlation::TraceCorrelator::new());
+    println!("[Correlation] Initialized trace correlator");
 
     // Start Control API for SDK communication
     let control_port = std::env::var("DEJA_CONTROL_PORT")
@@ -104,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control_state = Arc::new(control_api::ControlApiState {
         recorder: recorder.clone(),
         replay_engine: replay_engine.clone(),
+        correlator: correlator.clone(),
     });
 
     tokio::spawn(async move {
@@ -114,18 +126,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize TLS MITM if CA cert/key provided
     let tls_manager = {
-        let ca_cert_path = args.ca_cert.clone()
+        let ca_cert_path = args
+            .ca_cert
+            .clone()
             .or_else(|| std::env::var("DEJA_CA_CERT").ok());
-        let ca_key_path = args.ca_key.clone()
+        let ca_key_path = args
+            .ca_key
+            .clone()
             .or_else(|| std::env::var("DEJA_CA_KEY").ok());
 
         match (ca_cert_path, ca_key_path) {
             (Some(cert_path), Some(key_path)) => {
-                match (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path)) {
+                match (
+                    std::fs::read_to_string(&cert_path),
+                    std::fs::read_to_string(&key_path),
+                ) {
                     (Ok(cert_pem), Ok(key_pem)) => {
                         match deja_core::tls_mitm::TlsMitmManager::new(&cert_pem, &key_pem) {
                             Ok(manager) => {
-                                println!("[TLS] MITM manager initialized with CA from {}", cert_path);
+                                println!(
+                                    "[TLS] MITM manager initialized with CA from {}",
+                                    cert_path
+                                );
                                 Some(Arc::new(manager))
                             }
                             Err(e) => {
@@ -152,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let parsers: Vec<Arc<dyn ProtocolParser>> = vec![
+        Arc::new(GrpcParser), // Check for gRPC (HTTP/2) first
         Arc::new(HttpParser),
         Arc::new(PostgresParser),
         Arc::new(RedisParser),
@@ -185,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let replay_engine_clone = replay_engine.clone();
         let parsers_clone = parsers_arc.clone();
         let tls_manager_clone = tls_manager.clone();
+        let correlator_clone = correlator.clone();
 
         // Task for this listener
         tasks.push(tokio::spawn(async move {
@@ -199,6 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let lp = listen_port.clone();
                         let tls_mgr = tls_manager_clone.clone();
                         let th = target_host.clone();
+                        let corr = correlator_clone.clone();
 
                         // Spawn connection handler
                         tokio::spawn(async move {
@@ -214,7 +239,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         ps,
                                         rec,
                                         rep,
-                                    ).await {
+                                        corr,
+                                    )
+                                    .await
+                                    {
                                         eprintln!("[{}] TLS connection error: {}", lp, e);
                                     }
                                     return;
@@ -223,9 +251,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             // Plain connection
                             let detected_parser = detect_protocol(&client_socket, &ps).await;
-                            if let Err(e) =
-                                handle_connection(client_socket, target, detected_parser, rec, rep)
-                                    .await
+                            if let Err(e) = handle_connection(
+                                client_socket,
+                                target,
+                                detected_parser,
+                                rec,
+                                rep,
+                                corr,
+                            )
+                            .await
                             {
                                 eprintln!("[{}] Connection error: {}", lp, e);
                             }
@@ -265,6 +299,7 @@ async fn handle_tls_connection(
     parsers: Arc<Vec<Arc<dyn ProtocolParser>>>,
     recorder: Option<Arc<Recorder>>,
     replay_engine: Option<Arc<tokio::sync::Mutex<ReplayEngine>>>,
+    _correlator: Arc<correlation::TraceCorrelator>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Generate server config for this host (dynamically signed cert)
     let server_config = tls_manager.generate_server_config(target_host)?;
@@ -375,7 +410,9 @@ async fn handle_tls_connection(
     let c_handle = async move {
         let mut buf = [0u8; 8192];
         loop {
-            let n = c_read.read(&mut buf).await
+            let n = c_read
+                .read(&mut buf)
+                .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             if n == 0 {
                 break;
@@ -406,6 +443,15 @@ async fn handle_tls_connection(
                                     "postgres" => {
                                         deja_core::protocols::postgres::PgSerializer::serialize_error("No Replay Match").to_vec()
                                     }
+                                    "grpc" => {
+                                        // gRPC error: return empty frame with trailers indicating error
+                                        // For simplicity, return an empty response with error status
+                                        use deja_core::events::GrpcStatusCode;
+                                        deja_core::protocols::grpc::GrpcSerializer::serialize_error(
+                                            GrpcStatusCode::GrpcStatusInternal,
+                                            "No replay match found"
+                                        ).to_vec()
+                                    }
                                     _ => vec![],
                                 };
                                 if !error_bytes.is_empty() {
@@ -427,17 +473,17 @@ async fn handle_tls_connection(
 
                     if let Some(reply) = res.reply {
                         let mut cw = c_write_clone.lock().await;
-                        cw.write_all(&reply).await.map_err(|e| {
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        })?;
+                        cw.write_all(&reply)
+                            .await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     }
                 }
                 Err(_) => {
                     if let Some(tw) = &t_write_clone {
                         let mut tw = tw.lock().await;
-                        tw.write_all(&buf[..n]).await.map_err(|e| {
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        })?;
+                        tw.write_all(&buf[..n])
+                            .await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     }
                 }
             }
@@ -458,7 +504,9 @@ async fn handle_tls_connection(
         if let Some(mut tr) = t_read {
             let mut buf = [0u8; 8192];
             loop {
-                let n = tr.read(&mut buf).await
+                let n = tr
+                    .read(&mut buf)
+                    .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 if n == 0 {
                     break;
@@ -473,11 +521,13 @@ async fn handle_tls_connection(
                         }
                     }
                     let mut cw = c_write_clone2.lock().await;
-                    cw.write_all(&res.forward).await
+                    cw.write_all(&res.forward)
+                        .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 } else {
                     let mut cw = c_write_clone2.lock().await;
-                    cw.write_all(slice).await
+                    cw.write_all(slice)
+                        .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 }
             }
@@ -552,6 +602,7 @@ async fn handle_connection(
     parser: Arc<dyn ProtocolParser>,
     recorder: Option<Arc<Recorder>>,
     replay_engine: Option<Arc<tokio::sync::Mutex<ReplayEngine>>>,
+    _correlator: Arc<correlation::TraceCorrelator>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connection Logic - 1:1 Mapping for Transparency
     // NOTE: Connection pooling is not compatible with transparent recording of stateful L4/L7 protocols (like Postgres startup)
@@ -627,13 +678,20 @@ async fn handle_connection(
                                 );
                                 // No Match - Inject Error
                                 println!("No Match for trace: {}", event.trace_id);
-                                // ... (Error injection logic same as before, abbreviated here for brevity if needed, but keeping logic)
+                                // Error injection based on protocol
                                 let protocol = parser_arc_clone.protocol_id();
                                 let error_bytes = match protocol {
                                         "redis" => b"-ERR No replay match found\r\n".to_vec(),
                                         "http" => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
                                          "postgres" => {
                                              deja_core::protocols::postgres::PgSerializer::serialize_error("No Replay Match").to_vec()
+                                         },
+                                         "grpc" => {
+                                             use deja_core::events::GrpcStatusCode;
+                                             deja_core::protocols::grpc::GrpcSerializer::serialize_error(
+                                                 GrpcStatusCode::GrpcStatusInternal,
+                                                 "No replay match found"
+                                             ).to_vec()
                                          },
                                         _ => vec![],
                                     };

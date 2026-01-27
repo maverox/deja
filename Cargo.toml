@@ -5,6 +5,9 @@ members = [
     # "proto" # we will access proto as a library or build script inside core
     # "agent",
     "proxy",
+    "sdk",
+    "test-server",
+    "connector-service",
 ]
 resolver = "2"
 

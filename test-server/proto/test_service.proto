@@ -1,0 +1,99 @@
+syntax = "proto3";
+package test_service.v1;
+
+// Test service for Deja proxy integration testing
+// Receives gRPC requests and makes HTTP calls to backends
+service TestService {
+    // Simple echo with backend HTTP call
+    // Calls HTTP backend and returns combined response
+    rpc Echo(EchoRequest) returns (EchoResponse);
+    
+    // Generates non-deterministic values (UUID, timestamp, random)
+    // Used to test Deja SDK capture/replay
+    rpc GenerateId(GenerateIdRequest) returns (GenerateIdResponse);
+    
+    // Makes multiple HTTP calls to test interleaving/fan-out
+    rpc MultiBackendCall(MultiBackendRequest) returns (MultiBackendResponse);
+    
+    // Controllable behavior for edge case testing
+    rpc ControlledBehavior(ControlledRequest) returns (ControlledResponse);
+}
+
+// ============ Echo ============
+message EchoRequest {
+    string message = 1;
+    // Optional: which backend to call
+    string backend_url = 2;
+}
+
+message EchoResponse {
+    string original_message = 1;
+    string backend_response = 2;
+    int64 timestamp_ms = 3;
+}
+
+// ============ GenerateId ============
+message GenerateIdRequest {
+    // What types of IDs to generate
+    bool generate_uuid = 1;
+    bool generate_timestamp = 2;
+    bool generate_random = 3;
+    int32 random_byte_count = 4;
+}
+
+message GenerateIdResponse {
+    string uuid = 1;
+    int64 timestamp_ms = 2;
+    bytes random_bytes = 3;
+}
+
+// ============ MultiBackendCall ============
+message MultiBackendRequest {
+    // List of backend URLs to call
+    repeated string backend_urls = 1;
+    // Whether to call in parallel or sequentially
+    bool parallel = 2;
+    // Request body to send to each backend
+    string request_body = 3;
+}
+
+message BackendResult {
+    string url = 1;
+    int32 status_code = 2;
+    string response_body = 3;
+    int64 latency_ms = 4;
+    string error = 5;
+}
+
+message MultiBackendResponse {
+    repeated BackendResult results = 1;
+    int64 total_latency_ms = 2;
+}
+
+// ============ ControlledBehavior ============
+message ControlledRequest {
+    // Inject delay before responding
+    int64 delay_ms = 1;
+    // Return specific error code
+    int32 error_code = 2;
+    // Custom error message
+    string error_message = 3;
+    // Backend URL to call (optional)
+    string backend_url = 4;
+    // Simulate specific scenarios
+    Scenario scenario = 5;
+}
+
+enum Scenario {
+    SCENARIO_UNSPECIFIED = 0;
+    SCENARIO_SUCCESS = 1;
+    SCENARIO_TIMEOUT = 2;
+    SCENARIO_BACKEND_ERROR = 3;
+    SCENARIO_RANDOM_FAILURE = 4;
+}
+
+message ControlledResponse {
+    bool success = 1;
+    string message = 2;
+    int64 actual_delay_ms = 3;
+}

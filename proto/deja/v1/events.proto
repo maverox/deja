@@ -8,7 +8,7 @@ message RecordedEvent {
   uint64 sequence = 4;
   uint64 timestamp_ns = 5;
   string connection_id = 6;
-  
+
   oneof event {
     HttpRequestEvent http_request = 10;
     HttpResponseEvent http_response = 11;
@@ -21,8 +21,10 @@ message RecordedEvent {
     RedisCommandEvent redis_command = 18;
     RedisResponseEvent redis_response = 19;
     PgMessageEvent pg_message = 20;
+    GrpcRequestEvent grpc_request = 21;
+    GrpcResponseEvent grpc_response = 22;
   }
-  
+
   map<string, string> metadata = 100;
 }
 
@@ -223,4 +225,72 @@ message PgDataRow {
 
 message PgCommandComplete {
     string tag = 1;
+}
+
+// ============ gRPC Protocol Events ============
+
+// gRPC call types
+enum GrpcCallType {
+    GRPC_CALL_TYPE_UNSPECIFIED = 0;
+    GRPC_CALL_TYPE_UNARY = 1;
+    GRPC_CALL_TYPE_SERVER_STREAMING = 2;
+    GRPC_CALL_TYPE_CLIENT_STREAMING = 3;
+    GRPC_CALL_TYPE_BIDI_STREAMING = 4;
+}
+
+// Standard gRPC status codes
+enum GrpcStatusCode {
+    GRPC_STATUS_OK = 0;
+    GRPC_STATUS_CANCELLED = 1;
+    GRPC_STATUS_UNKNOWN = 2;
+    GRPC_STATUS_INVALID_ARGUMENT = 3;
+    GRPC_STATUS_DEADLINE_EXCEEDED = 4;
+    GRPC_STATUS_NOT_FOUND = 5;
+    GRPC_STATUS_ALREADY_EXISTS = 6;
+    GRPC_STATUS_PERMISSION_DENIED = 7;
+    GRPC_STATUS_RESOURCE_EXHAUSTED = 8;
+    GRPC_STATUS_FAILED_PRECONDITION = 9;
+    GRPC_STATUS_ABORTED = 10;
+    GRPC_STATUS_OUT_OF_RANGE = 11;
+    GRPC_STATUS_UNIMPLEMENTED = 12;
+    GRPC_STATUS_INTERNAL = 13;
+    GRPC_STATUS_UNAVAILABLE = 14;
+    GRPC_STATUS_DATA_LOSS = 15;
+    GRPC_STATUS_UNAUTHENTICATED = 16;
+}
+
+// gRPC request event - captures a unary RPC call from client
+message GrpcRequestEvent {
+    // Full service name (e.g., "grpc.health.v1.Health")
+    string service = 1;
+    // Method name (e.g., "Check")
+    string method = 2;
+    // Request message body (serialized protobuf)
+    bytes request_body = 3;
+    // gRPC metadata (like HTTP headers)
+    map<string, string> metadata = 4;
+    // Call type (unary, streaming, etc.)
+    GrpcCallType call_type = 5;
+    // HTTP/2 stream ID for correlation
+    uint32 stream_id = 6;
+    // Authority (host:port) from :authority pseudo-header
+    string authority = 7;
+}
+
+// gRPC response event - captures response from server
+message GrpcResponseEvent {
+    // Response message body (serialized protobuf)
+    bytes response_body = 1;
+    // gRPC status code
+    GrpcStatusCode status_code = 2;
+    // Status message (for non-OK status)
+    string status_message = 3;
+    // Response metadata (headers)
+    map<string, string> metadata = 4;
+    // Trailing metadata (trailers)
+    map<string, string> trailers = 5;
+    // Latency in milliseconds
+    uint64 latency_ms = 6;
+    // HTTP/2 stream ID for correlation
+    uint32 stream_id = 7;
 }

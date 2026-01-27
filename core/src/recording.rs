@@ -11,7 +11,7 @@ pub struct Recorder {
 impl Recorder {
     pub async fn new(base_path: impl Into<PathBuf>) -> Self {
         let path = base_path.into();
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
 
         let session_dir = path.join("sessions").join(&session_id);
         fs::create_dir_all(&session_dir).await.unwrap_or_default();

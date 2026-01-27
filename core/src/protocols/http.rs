@@ -102,14 +102,14 @@ impl ConnectionParser for HttpConnectionParser {
 
                 Ok(ParseResult {
                     events: vec![event],
-                    forward: Bytes::copy_from_slice(&data), // We forward everything transparently
+                    forward: Bytes::copy_from_slice(data), // We forward everything transparently
                     needs_more: false,
                     reply: None,
                 })
             }
             httparse::Status::Partial => Ok(ParseResult {
                 events: vec![],
-                forward: Bytes::copy_from_slice(&data),
+                forward: Bytes::copy_from_slice(data),
                 needs_more: true,
                 reply: None,
             }),

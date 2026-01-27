@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use thiserror::Error;
 
+pub mod filter;
+pub mod grpc;
 pub mod http;
 pub mod postgres;
 pub mod redis;

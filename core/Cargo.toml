@@ -30,6 +30,15 @@ tokio-rustls = "0.26"
 # HTTP client for NetworkRuntime
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# gRPC/HTTP2 support
+h2 = "0.4"
+
+# Configuration parsing
+toml = "0.8"
+
+# Pattern matching for filters
+glob = "0.3"
+
 [build-dependencies]
 prost-build = "0.12"
 

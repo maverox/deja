@@ -5,7 +5,6 @@
 //! - UUID generation
 //! - Timestamps
 //! - Random number generation
-//! - Task spawning (async boundaries)
 //!
 //! In production mode, these return real values.
 //! In recording mode, values are captured and sent to the proxy.
@@ -15,7 +14,7 @@ use async_trait::async_trait;
 use std::env;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -47,12 +46,8 @@ pub trait DejaRuntime: Send + Sync {
     /// Generate a nanoid (default 21 chars, alphanumeric)
     async fn nanoid(&self) -> String;
 
-    // ========== Generic Capture/Replay Interface ==========
-    // These methods allow clients to record ANY non-deterministic value
-    // without requiring core to enumerate all possible types.
-
     /// Record a non-deterministic value with a tag.
-    /// In production mode: no-op (value is ignored)
+    /// In production mode: no-op
     /// In recording mode: sends value to proxy for storage
     async fn capture(&self, tag: &str, value: &str);
 
@@ -60,10 +55,15 @@ pub trait DejaRuntime: Send + Sync {
     /// In production mode: returns None
     /// In replay mode: returns the recorded value
     async fn replay(&self, tag: &str) -> Option<String>;
+
+    /// Set the trace ID for correlating captures with requests.
+    fn set_trace_id(&self, trace_id: String);
+
+    /// Get the current trace ID.
+    fn get_trace_id(&self) -> String;
 }
 
 /// Helper function for deterministic execution with any runtime.
-/// This is separate from the trait because generic functions aren't dyn-compatible.
 ///
 /// Usage:
 /// ```ignore
@@ -85,11 +85,8 @@ where
 }
 
 /// Trait for async boundary operations (task spawning)
-/// These are separate from DejaRuntime because they involve generics that
-/// don't work well with async_trait.
 pub trait DejaAsyncBoundary: Send + Sync {
-    /// Spawn a named task. In recording mode, the spawn is recorded.
-    /// In replay mode, spawn ordering may be enforced (future enhancement).
+    /// Spawn a named task
     fn spawn<F, T>(&self, name: &str, future: F) -> JoinHandle<T>
     where
         F: Future<Output = T> + Send + 'static,
@@ -101,6 +98,10 @@ pub trait DejaAsyncBoundary: Send + Sync {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static;
 }
+
+// ============================================================================
+// ProductionRuntime - Pass-through implementation
+// ============================================================================
 
 /// Production runtime - generates real values, no recording/replay
 pub struct ProductionRuntime;
@@ -123,7 +124,6 @@ impl DejaAsyncBoundary for ProductionRuntime {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        // In production mode, just spawn without recording
         tokio::spawn(future)
     }
 
@@ -132,7 +132,6 @@ impl DejaAsyncBoundary for ProductionRuntime {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        // In production mode, just spawn without recording
         tokio::task::spawn_blocking(f)
     }
 }
@@ -170,7 +169,6 @@ impl DejaRuntime for ProductionRuntime {
     }
 
     async fn nanoid(&self) -> String {
-        // Simple nanoid implementation
         use rand::Rng;
         const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let mut rng = rand::thread_rng();
@@ -184,19 +182,22 @@ impl DejaRuntime for ProductionRuntime {
     }
 
     async fn replay(&self, _tag: &str) -> Option<String> {
-        // Production mode: always return None (use generator)
+        // Production mode: always return None
         None
+    }
+
+    fn set_trace_id(&self, _trace_id: String) {
+        // Production mode: no-op
+    }
+
+    fn get_trace_id(&self) -> String {
+        String::new()
     }
 }
 
-/// Network runtime - communicates with Deja proxy for recording/replay
-pub struct NetworkRuntime {
-    client: reqwest::Client,
-    proxy_url: String,
-    trace_id: Arc<RwLock<String>>,
-    mode: String,
-    task_sequence: Arc<AtomicU64>,
-}
+// ============================================================================
+// NetworkRuntime - Communicates with Deja proxy
+// ============================================================================
 
 /// Request body for /capture endpoint
 #[derive(serde::Serialize)]
@@ -213,6 +214,15 @@ struct ReplayResponse {
     found: bool,
 }
 
+/// Network runtime - communicates with Deja proxy for recording/replay
+pub struct NetworkRuntime {
+    client: reqwest::Client,
+    proxy_url: String,
+    trace_id: Arc<RwLock<String>>,
+    mode: String,
+    task_sequence: Arc<AtomicU64>,
+}
+
 impl NetworkRuntime {
     /// Create from environment variables
     ///
@@ -222,7 +232,8 @@ impl NetworkRuntime {
     pub fn from_env() -> Self {
         Self {
             client: reqwest::Client::new(),
-            proxy_url: env::var("DEJA_PROXY_URL").unwrap_or_else(|_| "http://localhost:9999".into()),
+            proxy_url: env::var("DEJA_PROXY_URL")
+                .unwrap_or_else(|_| "http://localhost:9999".into()),
             trace_id: Arc::new(RwLock::new(String::new())),
             mode: env::var("DEJA_MODE").unwrap_or_else(|_| "production".into()),
             task_sequence: Arc::new(AtomicU64::new(0)),
@@ -240,25 +251,9 @@ impl NetworkRuntime {
         }
     }
 
-    /// Set the current trace ID (call when handling a new request)
-    pub fn set_trace_id(&self, trace_id: String) {
-        *self.trace_id.write().unwrap() = trace_id;
-    }
-
     /// Get the current trace ID
     pub fn trace_id(&self) -> String {
         self.trace_id.read().unwrap().clone()
-    }
-
-    /// Create a clone with a specific trace ID
-    pub fn with_trace(&self, trace_id: String) -> Self {
-        Self {
-            client: self.client.clone(),
-            proxy_url: self.proxy_url.clone(),
-            trace_id: Arc::new(RwLock::new(trace_id)),
-            mode: self.mode.clone(),
-            task_sequence: self.task_sequence.clone(),
-        }
     }
 
     /// Check if in recording mode
@@ -271,7 +266,7 @@ impl NetworkRuntime {
         self.mode == "replay"
     }
 
-    /// POST a captured value to the proxy (internal use)
+    /// POST a captured value to the proxy
     async fn capture_internal(&self, kind: &str, value: &str) {
         let trace = self.trace_id();
         let req = CaptureRequest {
@@ -279,17 +274,19 @@ impl NetworkRuntime {
             kind: kind.to_string(),
             value: value.to_string(),
         };
-        let _ = self.client
+        let _ = self
+            .client
             .post(format!("{}/capture", self.proxy_url))
             .json(&req)
             .send()
             .await;
     }
 
-    /// GET a replayed value from the proxy (internal use)
+    /// GET a replayed value from the proxy
     async fn replay_internal(&self, kind: &str) -> Option<String> {
         let trace = self.trace_id();
-        let resp = self.client
+        let resp = self
+            .client
             .get(format!("{}/replay", self.proxy_url))
             .query(&[("trace_id", &trace), ("kind", &kind.to_string())])
             .send()
@@ -320,7 +317,6 @@ impl DejaRuntime for NetworkRuntime {
                         return id;
                     }
                 }
-                // Fallback - generate fresh (breaks determinism but allows forward progress)
                 Uuid::new_v4()
             }
             _ => Uuid::new_v4(),
@@ -331,11 +327,11 @@ impl DejaRuntime for NetworkRuntime {
         match self.mode.as_str() {
             "record" => {
                 let id = Uuid::now_v7();
-                self.capture_internal("uuid", &id.to_string()).await;
+                self.capture_internal("uuid_v7", &id.to_string()).await;
                 id
             }
             "replay" => {
-                if let Some(val) = self.replay_internal("uuid").await {
+                if let Some(val) = self.replay_internal("uuid_v7").await {
                     if let Ok(id) = Uuid::parse_str(&val) {
                         return id;
                     }
@@ -350,7 +346,8 @@ impl DejaRuntime for NetworkRuntime {
         match self.mode.as_str() {
             "record" => {
                 let now = SystemTime::now();
-                let ns = now.duration_since(SystemTime::UNIX_EPOCH)
+                let ns = now
+                    .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
                 self.capture_internal("time", &ns.to_string()).await;
@@ -410,23 +407,26 @@ impl DejaRuntime for NetworkRuntime {
             .collect()
     }
 
-    // Public trait methods for generic capture/replay
-    // Note: These delegate to the private methods with same names via fully qualified syntax
     async fn capture(&self, tag: &str, value: &str) {
-        // Only capture in record mode
         if self.mode == "record" {
-            // Use private capture method
             self.capture_internal(tag, value).await;
         }
     }
 
     async fn replay(&self, tag: &str) -> Option<String> {
-        // Only replay in replay mode
         if self.mode == "replay" {
             self.replay_internal(tag).await
         } else {
             None
         }
+    }
+
+    fn set_trace_id(&self, trace_id: String) {
+        *self.trace_id.write().unwrap() = trace_id;
+    }
+
+    fn get_trace_id(&self) -> String {
+        self.trace_id.read().unwrap().clone()
     }
 }
 
@@ -444,7 +444,6 @@ impl DejaAsyncBoundary for NetworkRuntime {
         let mode = self.mode.clone();
 
         tokio::spawn(async move {
-            // Record task spawn in record mode
             if mode == "record" {
                 let value = format!("{}:{}", task_name, task_seq);
                 let req = CaptureRequest {
@@ -458,38 +457,22 @@ impl DejaAsyncBoundary for NetworkRuntime {
                     .send()
                     .await;
             }
-
-            // Execute the actual future
             future.await
         })
     }
 
-    fn spawn_blocking<F, T>(&self, name: &str, f: F) -> JoinHandle<T>
+    fn spawn_blocking<F, T>(&self, _name: &str, f: F) -> JoinHandle<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        // For blocking tasks, we record similarly but execute via spawn_blocking
-        let trace_id = self.trace_id();
-        let task_seq = self.task_sequence.fetch_add(1, Ordering::SeqCst);
-        let task_name = name.to_string();
-        let mode = self.mode.clone();
-
-        if mode == "record" {
-            // Note: We can't easily make a network call here synchronously
-            // For now, just log the spawn. Full implementation would need
-            // a background queue to handle recording.
-            tracing::debug!(
-                trace_id = %trace_id,
-                task_name = %task_name,
-                task_seq = %task_seq,
-                "Recording blocking task spawn"
-            );
-        }
-
         tokio::task::spawn_blocking(f)
     }
 }
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 /// Get the appropriate runtime based on environment
 pub fn get_runtime() -> Box<dyn DejaRuntime> {
@@ -509,6 +492,76 @@ pub fn get_runtime_arc() -> Arc<dyn DejaRuntime> {
     }
 }
 
+/// Capture a non-deterministic value synchronously using fire-and-forget.
+///
+/// This sends a capture request directly to the Deja proxy.
+/// Used by sync ID generation functions to record values without blocking.
+///
+/// Environment variables:
+/// - `DEJA_MODE`: Must be "record" for captures to be sent
+/// - `DEJA_PROXY_URL`: URL of the Deja proxy (default: http://localhost:9999)
+pub fn capture_sync(tag: &str, value: &str) {
+    // Cache the mode check to avoid repeated env var lookups
+    static DEJA_MODE: OnceLock<String> = OnceLock::new();
+    static DEJA_PROXY_URL: OnceLock<String> = OnceLock::new();
+
+    let mode = DEJA_MODE
+        .get_or_init(|| std::env::var("DEJA_MODE").unwrap_or_else(|_| "production".to_string()));
+
+    // Only capture in record mode
+    if mode != "record" {
+        return;
+    }
+
+    let proxy_url = DEJA_PROXY_URL.get_or_init(|| {
+        std::env::var("DEJA_PROXY_URL").unwrap_or_else(|_| "http://localhost:9999".to_string())
+    });
+
+    let tag = tag.to_string();
+    let value = value.to_string();
+    let url = format!("{}/capture", proxy_url);
+
+    // Fire-and-forget: spawn a task to send the capture
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let client = reqwest::Client::new();
+                let _ = client
+                    .post(&url)
+                    .json(&serde_json::json!({
+                        "trace_id": "",
+                        "kind": tag,
+                        "value": value
+                    }))
+                    .send()
+                    .await;
+            });
+        }
+        Err(_) => {
+            // No tokio runtime context - use a thread
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(async {
+                        let client = reqwest::Client::new();
+                        let _ = client
+                            .post(&url)
+                            .json(&serde_json::json!({
+                                "trace_id": "",
+                                "kind": tag,
+                                "value": value
+                            }))
+                            .send()
+                            .await;
+                    });
+                }
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,10 +576,6 @@ mod tests {
         let time = runtime.now().await;
         assert!(time > SystemTime::UNIX_EPOCH);
 
-        let random = runtime.random_u64().await;
-        // Just ensure it doesn't panic
-        let _ = random;
-
         let nanoid = runtime.nanoid().await;
         assert_eq!(nanoid.len(), 21);
     }
@@ -539,9 +588,5 @@ mod tests {
 
         runtime.set_trace_id("test-trace-123".into());
         assert_eq!(runtime.trace_id(), "test-trace-123");
-
-        let cloned = runtime.with_trace("other-trace".into());
-        assert_eq!(cloned.trace_id(), "other-trace");
-        assert_eq!(runtime.trace_id(), "test-trace-123"); // Original unchanged
     }
 }

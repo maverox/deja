@@ -28,6 +28,12 @@ pub struct DiffReport {
     pub total_mismatched: usize,
 }
 
+impl Default for DiffReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiffReport {
     pub fn new() -> Self {
         Self {
@@ -192,14 +198,12 @@ fn compare_bodies(
         serde_json::from_slice::<Value>(c),
     ) {
         compare_json(&val_b, &val_c, config, diffs, path_prefix);
-    } else {
-        if b != c {
-            diffs.push(DiffDetail {
-                path: path_prefix.into(),
-                baseline: format!("<bytes len {}>", b.len()),
-                candidate: format!("<bytes len {}>", c.len()),
-            });
-        }
+    } else if b != c {
+        diffs.push(DiffDetail {
+            path: path_prefix.into(),
+            baseline: format!("<bytes len {}>", b.len()),
+            candidate: format!("<bytes len {}>", c.len()),
+        });
     }
 }
 
