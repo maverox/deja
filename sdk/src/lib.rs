@@ -26,9 +26,25 @@
 mod runtime;
 
 pub use runtime::{
-    capture_sync, deterministic, get_runtime, get_runtime_arc, DejaAsyncBoundary, DejaRuntime,
-    NetworkRuntime, ProductionRuntime,
+    capture_sync, deterministic, get_network_runtime, get_runtime, get_runtime_arc,
+    DejaAsyncBoundary, NetworkRuntime, ProductionRuntime,
 };
+
+pub mod trace_context {
+    pub use deja_core::runtime::trace_context::*;
+}
+
+pub mod control_api {
+    pub use deja_common::control::{ControlClient, ControlMessage};
+}
+
+pub use deja_common::{ControlClient, ControlMessage, DejaRuntime};
+pub use trace_context::{generate_trace_id, with_trace_id};
+
+#[cfg(feature = "axum")]
+pub mod axum;
+
+pub mod reqwest;
 
 pub mod sync_runtime;
 pub use sync_runtime::{

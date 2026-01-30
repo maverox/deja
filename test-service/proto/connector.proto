@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package connector;
+
+service Connector {
+    rpc Process(ProcessRequest) returns (ProcessResponse);
+}
+
+message ProcessRequest {
+    string id = 1;
+    string data = 2;
+}
+
+message ProcessResponse {
+    string trace_id = 1;
+    string pg_result = 2;
+    string redis_result = 3;
+    string http_result = 4;
+    string status = 5;
+    // Non-deterministic values captured via Deja runtime
+    string generated_uuid = 6;
+    uint64 timestamp_ms = 7;
+}

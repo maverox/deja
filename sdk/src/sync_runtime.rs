@@ -6,8 +6,8 @@
 //! Mirrors `DejaRuntime` but uses blocking I/O.
 
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+// use std::sync::atomic::{AtomicU64, Ordering};
+// use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -161,12 +161,11 @@ impl SyncNetworkRuntime {
     }
 
     fn replay_internal(&self, kind: &str) -> Option<String> {
-        let resp = self
-            .client
-            .get(format!("{}/replay", self.proxy_url))
-            .query(&[("trace_id", &self.trace_id), ("kind", &kind.to_string())])
-            .send()
-            .ok()?;
+        let url = format!(
+            "{}/replay?trace_id={}&kind={}",
+            self.proxy_url, self.trace_id, kind
+        );
+        let resp = self.client.get(url).send().ok()?;
 
         let replay_resp: ReplayResponse = resp.json().ok()?;
         if replay_resp.found {

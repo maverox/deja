@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "common",
     "core",
     "cli",
     # "proto" # we will access proto as a library or build script inside core
@@ -7,7 +8,7 @@ members = [
     "proxy",
     "sdk",
     "test-server",
-    "connector-service",
+    "test-service",
 ]
 resolver = "2"
 

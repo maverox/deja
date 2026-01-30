@@ -16,15 +16,83 @@ impl GrpcSerializer {
     /// This creates a simplified HTTP/2 response that most gRPC clients will accept.
     /// For a proper implementation, we'd need full HTTP/2 framing, but for basic
     /// replay, we can use HTTP/1.1 upgrade or direct frame injection.
+    /// Serialize a gRPC response event to wire format bytes (HTTP/2 frames)
+    ///
+    /// This creates a full HTTP/2 response sequence:
+    /// 1. HEADERS frame (Initial headers)
+    /// 2. DATA frame (gRPC message)
+    /// 3. HEADERS frame (Trailers with status)
     pub fn serialize_response(response: &GrpcResponseEvent) -> Bytes {
         let mut buf = BytesMut::new();
+        let mut encoder = hpack::Encoder::new();
 
-        // For gRPC-Web or direct frame replay, we just need the length-prefixed message
-        // The actual HTTP/2 framing is handled by the transport layer (h2 crate)
+        // --- 1. HEADERS Frame (Initial) ---
+        let mut headers = vec![
+            (b":status".to_vec(), b"200".to_vec()),
+            (b"content-type".to_vec(), b"application/grpc".to_vec()),
+        ];
 
-        // Build the gRPC message frame
-        let frame = GrpcFrame::new(Bytes::copy_from_slice(&response.response_body));
-        buf.extend_from_slice(&frame.encode());
+        // Add recorded metadata that aren't pseudo-headers or restricted
+        for (k, v) in &response.metadata {
+            if !k.starts_with(':') && k.to_lowercase() != "content-length" {
+                headers.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
+            }
+        }
+
+        let header_payload = encoder.encode(headers.iter().map(|(k, v)| (&k[..], &v[..])));
+
+        let mut h_frame = BytesMut::with_capacity(9 + header_payload.len());
+        let h_len = header_payload.len() as u32;
+        h_frame.put_u8((h_len >> 16) as u8);
+        h_frame.put_u8((h_len >> 8) as u8);
+        h_frame.put_u8(h_len as u8);
+        h_frame.put_u8(0x01); // type=HEADERS
+        h_frame.put_u8(0x04); // flags=END_HEADERS (0x04)
+        h_frame.put_u32(response.stream_id & 0x7FFFFFFF); // stream_id
+        h_frame.extend_from_slice(&header_payload);
+        buf.extend_from_slice(&h_frame);
+
+        // --- 2. DATA Frame (gRPC Message) ---
+        let msg_frame = GrpcFrame::new(Bytes::copy_from_slice(&response.response_body)).encode();
+        let mut d_frame = BytesMut::with_capacity(9 + msg_frame.len());
+        let d_len = msg_frame.len() as u32;
+        d_frame.put_u8((d_len >> 16) as u8);
+        d_frame.put_u8((d_len >> 8) as u8);
+        d_frame.put_u8(d_len as u8);
+        d_frame.put_u8(0x00); // type=DATA
+        d_frame.put_u8(0x00); // flags=0
+        d_frame.put_u32(response.stream_id & 0x7FFFFFFF);
+        d_frame.extend_from_slice(&msg_frame);
+        buf.extend_from_slice(&d_frame);
+
+        // --- 3. HEADERS Frame (Trailers) ---
+        let mut trailers = vec![(
+            b"grpc-status".to_vec(),
+            response.status_code.to_string().into_bytes(),
+        )];
+        if !response.status_message.is_empty() {
+            trailers.push((
+                b"grpc-message".to_vec(),
+                response.status_message.as_bytes().to_vec(),
+            ));
+        }
+        for (k, v) in &response.trailers {
+            if k.to_lowercase() != "grpc-status" && k.to_lowercase() != "grpc-message" {
+                trailers.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
+            }
+        }
+
+        let trailer_payload = encoder.encode(trailers.iter().map(|(k, v)| (&k[..], &v[..])));
+        let mut t_frame = BytesMut::with_capacity(9 + trailer_payload.len());
+        let t_len = trailer_payload.len() as u32;
+        t_frame.put_u8((t_len >> 16) as u8);
+        t_frame.put_u8((t_len >> 8) as u8);
+        t_frame.put_u8(t_len as u8);
+        t_frame.put_u8(0x01); // type=HEADERS
+        t_frame.put_u8(0x05); // flags=END_STREAM (0x01) | END_HEADERS (0x04)
+        t_frame.put_u32(response.stream_id & 0x7FFFFFFF);
+        t_frame.extend_from_slice(&trailer_payload);
+        buf.extend_from_slice(&t_frame);
 
         buf.freeze()
     }

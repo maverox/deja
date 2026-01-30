@@ -78,7 +78,7 @@ async fn test_postgres_replay_responses() -> Result<(), Box<dyn std::error::Erro
     let result = engine.find_match_with_responses(&incoming);
     assert!(result.is_some(), "Should match query");
 
-    let (_matched, responses) = result.unwrap();
+    let (_matched, _response_events, responses) = result.unwrap();
     // Expect DataRow, CommandComplete, and ReadyForQuery = 3
     assert_eq!(responses.len(), 3, "Should have 3 response packets");
 

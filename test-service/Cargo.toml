@@ -1,11 +1,12 @@
 [package]
-name = "connector-service"
+name = "test-service"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Deja core
-deja-core = { path = "../core" }
+# Deja SDK
+deja-sdk = { path = "../sdk", features = ["axum"] }
+deja-core = { path = "../core" } # Still need core for some shared types/proto if not re-exported
 
 # Web framework
 axum = "0.7"
@@ -29,3 +30,14 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }
 
 # Redis
 redis = { version = "0.25", features = ["tokio-comp"] }
+tonic = "0.13"
+prost = "0.13"
+reqwest = { version = "0.13.1", features = ["json"] }
+tokio-stream = "0.1.18"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
+similar = "2.4"
+tempfile = "3.24.0"

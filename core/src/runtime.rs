@@ -16,12 +16,13 @@
 //! The trace_context module provides task-local storage for trace IDs that enable
 //! accurate correlation of concurrent requests and background tasks.
 
-pub mod trace_context;
-pub mod spawn;
-pub mod socket_interceptor;
 pub mod pool_interceptor;
+pub mod socket_interceptor;
+pub mod spawn;
+pub mod trace_context;
 
 use async_trait::async_trait;
+use deja_common::DejaRuntime;
 use std::env;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,48 +30,6 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-
-/// Trait for handling non-deterministic operations in a replay-friendly way.
-///
-/// Services should use this trait instead of directly calling `Uuid::new_v4()`,
-/// `SystemTime::now()`, etc. to enable deterministic replay.
-#[async_trait]
-pub trait DejaRuntime: Send + Sync {
-    /// Generate a UUID v4
-    async fn uuid(&self) -> Uuid;
-
-    /// Generate a UUID v7 (time-ordered)
-    async fn uuid_v7(&self) -> Uuid;
-
-    /// Get current system time
-    async fn now(&self) -> SystemTime;
-
-    /// Get current time as milliseconds since epoch
-    async fn now_millis(&self) -> u64;
-
-    /// Generate a random u64
-    async fn random_u64(&self) -> u64;
-
-    /// Generate random bytes
-    async fn random_bytes(&self, len: usize) -> Vec<u8>;
-
-    /// Generate a nanoid (default 21 chars, alphanumeric)
-    async fn nanoid(&self) -> String;
-
-    // ========== Generic Capture/Replay Interface ==========
-    // These methods allow clients to record ANY non-deterministic value
-    // without requiring core to enumerate all possible types.
-
-    /// Record a non-deterministic value with a tag.
-    /// In production mode: no-op (value is ignored)
-    /// In recording mode: sends value to proxy for storage
-    async fn capture(&self, tag: &str, value: &str);
-
-    /// Replay a recorded value by tag.
-    /// In production mode: returns None
-    /// In replay mode: returns the recorded value
-    async fn replay(&self, tag: &str) -> Option<String>;
-}
 
 /// Helper function for deterministic execution with any runtime.
 /// This is separate from the trait because generic functions aren't dyn-compatible.
@@ -197,6 +156,14 @@ impl DejaRuntime for ProductionRuntime {
         // Production mode: always return None (use generator)
         None
     }
+
+    fn set_trace_id(&self, _trace_id: String) {}
+    fn get_trace_id(&self) -> String {
+        String::new()
+    }
+    fn control_client(&self) -> deja_common::ControlClient {
+        deja_common::ControlClient::new("localhost", 9999)
+    }
 }
 
 /// Network runtime - communicates with Deja proxy for recording/replay
@@ -232,7 +199,8 @@ impl NetworkRuntime {
     pub fn from_env() -> Self {
         Self {
             client: reqwest::Client::new(),
-            proxy_url: env::var("DEJA_PROXY_URL").unwrap_or_else(|_| "http://localhost:9999".into()),
+            proxy_url: env::var("DEJA_PROXY_URL")
+                .unwrap_or_else(|_| "http://localhost:9999".into()),
             trace_id: Arc::new(RwLock::new(String::new())),
             mode: env::var("DEJA_MODE").unwrap_or_else(|_| "production".into()),
             task_sequence: Arc::new(AtomicU64::new(0)),
@@ -252,12 +220,26 @@ impl NetworkRuntime {
 
     /// Set the current trace ID (call when handling a new request)
     pub fn set_trace_id(&self, trace_id: String) {
-        *self.trace_id.write().unwrap() = trace_id;
+        match self.trace_id.write() {
+            Ok(mut guard) => {
+                *guard = trace_id;
+            }
+            Err(e) => {
+                tracing::warn!("trace_id lock poisoned, recovering: {}", e);
+                *e.into_inner() = trace_id;
+            }
+        }
     }
 
     /// Get the current trace ID
     pub fn trace_id(&self) -> String {
-        self.trace_id.read().unwrap().clone()
+        match self.trace_id.read() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                tracing::warn!("trace_id lock poisoned, recovering: {}", e);
+                e.into_inner().clone()
+            }
+        }
     }
 
     /// Create a clone with a specific trace ID
@@ -289,7 +271,8 @@ impl NetworkRuntime {
             kind: kind.to_string(),
             value: value.to_string(),
         };
-        let _ = self.client
+        let _ = self
+            .client
             .post(format!("{}/capture", self.proxy_url))
             .json(&req)
             .send()
@@ -299,7 +282,8 @@ impl NetworkRuntime {
     /// GET a replayed value from the proxy (internal use)
     async fn replay_internal(&self, kind: &str) -> Option<String> {
         let trace = self.trace_id();
-        let resp = self.client
+        let resp = self
+            .client
             .get(format!("{}/replay", self.proxy_url))
             .query(&[("trace_id", &trace), ("kind", &kind.to_string())])
             .send()
@@ -360,7 +344,8 @@ impl DejaRuntime for NetworkRuntime {
         match self.mode.as_str() {
             "record" => {
                 let now = SystemTime::now();
-                let ns = now.duration_since(SystemTime::UNIX_EPOCH)
+                let ns = now
+                    .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
                 self.capture_internal("time", &ns.to_string()).await;
@@ -438,6 +423,27 @@ impl DejaRuntime for NetworkRuntime {
             None
         }
     }
+
+    fn set_trace_id(&self, trace_id: String) {
+        self.set_trace_id(trace_id);
+    }
+
+    fn get_trace_id(&self) -> String {
+        self.trace_id()
+    }
+
+    fn control_client(&self) -> deja_common::ControlClient {
+        let (host, port) = parse_proxy_url(&self.proxy_url);
+        deja_common::ControlClient::new(&host, port)
+    }
+}
+
+fn parse_proxy_url(url: &str) -> (String, u16) {
+    let stripped = url.replace("http://", "").replace("https://", "");
+    let parts: Vec<&str> = stripped.split(':').collect();
+    let host = parts.get(0).copied().unwrap_or("localhost").to_string();
+    let port = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(9999);
+    (host, port)
 }
 
 impl DejaAsyncBoundary for NetworkRuntime {

@@ -1,0 +1,16 @@
+[package]
+name = "deja-common"
+version = "0.1.0"
+edition = "2021"
+description = "Common types shared between deja crates"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+async-trait = "0.1"
+reqwest = { version = "0.13.1", features = ["json"] }
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]

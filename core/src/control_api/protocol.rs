@@ -25,6 +25,7 @@
 //!   - `/control/trace` - Trace lifecycle events (start/end)
 //!   - `/control/connection` - Connection association/update events
 
+use deja_common::Protocol;
 use serde::{Deserialize, Serialize};
 
 /// Control API message from service to proxy
@@ -61,6 +62,9 @@ pub enum ControlMessage {
         connection_id: String,
         /// Nanosecond timestamp when association occurred
         timestamp_ns: u64,
+        /// Protocol for this connection (postgres, redis, http, grpc)
+        #[serde(default)]
+        protocol: Option<Protocol>,
     },
 
     /// Update a connection's trace ID (for connection pool reuse)
@@ -114,6 +118,21 @@ impl ControlMessage {
             trace_id: trace_id.into(),
             connection_id: connection_id.into(),
             timestamp_ns: current_time_ns(),
+            protocol: None,
+        }
+    }
+
+    /// Create an AssociateConnection message with protocol and current timestamp
+    pub fn associate_connection_with_protocol(
+        trace_id: impl Into<String>,
+        connection_id: impl Into<String>,
+        protocol: Protocol,
+    ) -> Self {
+        Self::AssociateConnection {
+            trace_id: trace_id.into(),
+            connection_id: connection_id.into(),
+            timestamp_ns: current_time_ns(),
+            protocol: Some(protocol),
         }
     }
 
@@ -201,12 +220,25 @@ mod tests {
             trace_id: "trace-789".to_string(),
             connection_id: "127.0.0.1:5433".to_string(),
             timestamp_ns: 3000000,
+            protocol: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"associate_connection\""));
         assert!(json.contains("\"trace_id\":\"trace-789\""));
         assert!(json.contains("\"connection_id\":\"127.0.0.1:5433\""));
+    }
+
+    #[test]
+    fn test_associate_connection_with_protocol_serialization() {
+        let msg = ControlMessage::associate_connection_with_protocol(
+            "trace-abc",
+            "192.168.1.1:5432",
+            Protocol::Postgres,
+        );
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"protocol\":\"postgres\""));
     }
 
     #[test]

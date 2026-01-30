@@ -10,9 +10,11 @@
 //! each event belongs to. This module maintains that mapping by:
 //!
 //! 1. **Recording trace starts/ends**: Track active traces and their lifetimes
-//! 2. **Associating connections**: Map each connection to its trace
-//! 3. **Updating associations**: Handle connection pool reuse (same connection, different trace)
+//! 2. **Associating connections**: Map each connection to its trace AND protocol
+//! 3. **Tracking sequences**: Maintain per-(trace, protocol) message sequence numbers
+//! 4. **Updating associations**: Handle connection pool reuse (same connection, different trace)
 
+use deja_common::{Protocol, SequenceKey, SequenceTracker};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -36,6 +38,8 @@ pub struct TraceMetadata {
 /// This is the main component that tracks:
 /// - Which traces are currently active
 /// - Which connections belong to which traces
+/// - Which protocol each connection uses
+/// - Per-(trace, protocol) message sequence numbers
 /// - Connection pool reuse patterns
 pub struct TraceCorrelator {
     /// Maps connection address (as string) to trace ID
@@ -45,6 +49,12 @@ pub struct TraceCorrelator {
     /// Metadata about active and completed traces
     /// Maps trace_id -> TraceMetadata
     active_traces: Arc<RwLock<HashMap<String, TraceMetadata>>>,
+
+    /// Maps connection_id -> Protocol for protocol-scoped sequence tracking
+    connection_protocol: Arc<RwLock<HashMap<String, Protocol>>>,
+
+    /// Sequence tracker for (trace_id, protocol) pairs
+    sequence_tracker: Arc<RwLock<SequenceTracker>>,
 }
 
 impl TraceCorrelator {
@@ -53,6 +63,8 @@ impl TraceCorrelator {
         Self {
             connection_to_trace: Arc::new(RwLock::new(HashMap::new())),
             active_traces: Arc::new(RwLock::new(HashMap::new())),
+            connection_protocol: Arc::new(RwLock::new(HashMap::new())),
+            sequence_tracker: Arc::new(RwLock::new(SequenceTracker::new())),
         }
     }
 
@@ -74,10 +86,7 @@ impl TraceCorrelator {
             connection_count: 0,
         };
 
-        self.active_traces
-            .write()
-            .await
-            .insert(trace_id, metadata);
+        self.active_traces.write().await.insert(trace_id, metadata);
     }
 
     /// Record that a trace has ended
@@ -171,7 +180,10 @@ impl TraceCorrelator {
     /// * `connection_id` - The connection to remove
     pub async fn cleanup_connection(&self, connection_id: String) {
         trace!(connection = %connection_id, "Cleaning up connection mapping");
-        self.connection_to_trace.write().await.remove(&connection_id);
+        self.connection_to_trace
+            .write()
+            .await
+            .remove(&connection_id);
     }
 
     /// Get metadata about a trace
@@ -184,11 +196,7 @@ impl TraceCorrelator {
     ///
     /// The trace metadata if the trace is/was active
     pub async fn get_trace_metadata(&self, trace_id: &str) -> Option<TraceMetadata> {
-        self.active_traces
-            .read()
-            .await
-            .get(trace_id)
-            .cloned()
+        self.active_traces.read().await.get(trace_id).cloned()
     }
 
     /// Get all active trace IDs
@@ -206,12 +214,7 @@ impl TraceCorrelator {
 
     /// Get all trace IDs (active and inactive)
     pub async fn get_all_traces(&self) -> Vec<String> {
-        self.active_traces
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect()
+        self.active_traces.read().await.keys().cloned().collect()
     }
 
     /// Cleanup old traces (for memory management)
@@ -228,12 +231,127 @@ impl TraceCorrelator {
             .unwrap_or(0);
 
         let mut traces = self.active_traces.write().await;
-        traces.retain(|_, metadata| {
-            match metadata.end_time_ns {
-                Some(end_time) if (now_ns - end_time) > max_age_ns => false,
-                _ => true,
-            }
+        traces.retain(|_, metadata| match metadata.end_time_ns {
+            Some(end_time) if (now_ns - end_time) > max_age_ns => false,
+            _ => true,
         });
+    }
+
+    // ============ Protocol-Scoped Sequence Tracking ============
+
+    /// Associate a connection with a trace AND protocol
+    ///
+    /// This is the protocol-aware version that enables sequence tracking.
+    /// Called when a new connection is established and its protocol is detected.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_id` - The connection identifier
+    /// * `trace_id` - The trace this connection belongs to
+    /// * `protocol` - The detected protocol for this connection
+    pub async fn associate_connection_with_protocol(
+        &self,
+        connection_id: String,
+        trace_id: String,
+        protocol: Protocol,
+    ) {
+        debug!(
+            connection = %connection_id,
+            trace = %trace_id,
+            protocol = %protocol,
+            "Associating connection with trace and protocol"
+        );
+
+        // Update connection -> trace mapping
+        self.connection_to_trace
+            .write()
+            .await
+            .insert(connection_id.clone(), trace_id.clone());
+
+        // Update connection -> protocol mapping
+        self.connection_protocol
+            .write()
+            .await
+            .insert(connection_id.clone(), protocol);
+
+        // Increment connection count for this trace
+        if let Some(metadata) = self.active_traces.write().await.get_mut(&trace_id) {
+            metadata.connection_count += 1;
+        }
+    }
+
+    /// Get the protocol for a given connection
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_id` - The connection to look up
+    ///
+    /// # Returns
+    ///
+    /// The protocol if found, or None if this connection is not mapped
+    pub async fn get_protocol(&self, connection_id: &str) -> Option<Protocol> {
+        self.connection_protocol
+            .read()
+            .await
+            .get(connection_id)
+            .copied()
+    }
+
+    /// Get the next sequence number for a (trace, protocol) pair
+    ///
+    /// This is the key method for deterministic replay. Each call returns
+    /// an incrementing sequence number scoped to the (trace_id, protocol) pair.
+    ///
+    /// # Arguments
+    ///
+    /// * `trace_id` - The trace ID
+    /// * `protocol` - The protocol
+    ///
+    /// # Returns
+    ///
+    /// The next sequence number (0-indexed, incrementing)
+    pub async fn next_sequence(&self, trace_id: &str, protocol: Protocol) -> u64 {
+        self.sequence_tracker
+            .write()
+            .await
+            .next_sequence(trace_id, protocol)
+    }
+
+    /// Get the current sequence without incrementing
+    ///
+    /// Useful for debugging or looking ahead
+    pub async fn current_sequence(&self, trace_id: &str, protocol: Protocol) -> u64 {
+        self.sequence_tracker
+            .read()
+            .await
+            .current_sequence(trace_id, protocol)
+    }
+
+    /// Get both trace_id and protocol for a connection in one call
+    ///
+    /// Convenience method that avoids two separate lock acquisitions
+    pub async fn get_connection_info(&self, connection_id: &str) -> Option<(String, Protocol)> {
+        let trace_id = self
+            .connection_to_trace
+            .read()
+            .await
+            .get(connection_id)
+            .cloned()?;
+        let protocol = self
+            .connection_protocol
+            .read()
+            .await
+            .get(connection_id)
+            .copied()?;
+        Some((trace_id, protocol))
+    }
+
+    /// Get next sequence for a connection (looks up trace and protocol automatically)
+    ///
+    /// This is the most convenient method for use in proxy handlers
+    pub async fn next_sequence_for_connection(&self, connection_id: &str) -> Option<u64> {
+        let (trace_id, protocol) = self.get_connection_info(connection_id).await?;
+        Some(self.next_sequence(&trace_id, protocol).await)
     }
 }
 
@@ -366,5 +484,126 @@ mod tests {
 
         let metadata = correlator.get_trace_metadata(&trace_id).await.unwrap();
         assert_eq!(metadata.connection_count, 3);
+    }
+
+    // ============ Protocol-Scoped Sequence Tests ============
+
+    #[tokio::test]
+    async fn test_associate_connection_with_protocol() {
+        let correlator = TraceCorrelator::new();
+        let trace_id = "trace-proto".to_string();
+        let conn_id = "127.0.0.1:5432".to_string();
+
+        correlator.start_trace(trace_id.clone(), 1000).await;
+        correlator
+            .associate_connection_with_protocol(
+                conn_id.clone(),
+                trace_id.clone(),
+                Protocol::Postgres,
+            )
+            .await;
+
+        // Verify both trace and protocol are stored
+        let found_trace = correlator.get_trace_id(&conn_id).await;
+        assert_eq!(found_trace, Some(trace_id));
+
+        let found_protocol = correlator.get_protocol(&conn_id).await;
+        assert_eq!(found_protocol, Some(Protocol::Postgres));
+    }
+
+    #[tokio::test]
+    async fn test_sequence_tracking_per_protocol() {
+        let correlator = TraceCorrelator::new();
+        let trace_id = "trace-seq";
+
+        correlator.start_trace(trace_id.to_string(), 1000).await;
+
+        // Postgres sequences are independent of Redis
+        assert_eq!(
+            correlator.next_sequence(trace_id, Protocol::Postgres).await,
+            0
+        );
+        assert_eq!(
+            correlator.next_sequence(trace_id, Protocol::Postgres).await,
+            1
+        );
+        assert_eq!(correlator.next_sequence(trace_id, Protocol::Redis).await, 0); // Independent!
+        assert_eq!(
+            correlator.next_sequence(trace_id, Protocol::Postgres).await,
+            2
+        );
+        assert_eq!(correlator.next_sequence(trace_id, Protocol::Redis).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_tracking_per_trace() {
+        let correlator = TraceCorrelator::new();
+
+        correlator.start_trace("trace-1".to_string(), 1000).await;
+        correlator.start_trace("trace-2".to_string(), 2000).await;
+
+        // Different traces have independent sequences even for same protocol
+        assert_eq!(
+            correlator
+                .next_sequence("trace-1", Protocol::Postgres)
+                .await,
+            0
+        );
+        assert_eq!(
+            correlator
+                .next_sequence("trace-2", Protocol::Postgres)
+                .await,
+            0
+        );
+        assert_eq!(
+            correlator
+                .next_sequence("trace-1", Protocol::Postgres)
+                .await,
+            1
+        );
+        assert_eq!(
+            correlator
+                .next_sequence("trace-2", Protocol::Postgres)
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_sequence_for_connection() {
+        let correlator = TraceCorrelator::new();
+        let trace_id = "trace-conn-seq".to_string();
+        let conn_id = "127.0.0.1:5432".to_string();
+
+        correlator.start_trace(trace_id.clone(), 1000).await;
+        correlator
+            .associate_connection_with_protocol(conn_id.clone(), trace_id, Protocol::Postgres)
+            .await;
+
+        // Get sequence via connection lookup
+        let seq1 = correlator.next_sequence_for_connection(&conn_id).await;
+        let seq2 = correlator.next_sequence_for_connection(&conn_id).await;
+
+        assert_eq!(seq1, Some(0));
+        assert_eq!(seq2, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_get_connection_info() {
+        let correlator = TraceCorrelator::new();
+        let trace_id = "trace-info".to_string();
+        let conn_id = "10.0.0.1:6379".to_string();
+
+        correlator.start_trace(trace_id.clone(), 1000).await;
+        correlator
+            .associate_connection_with_protocol(conn_id.clone(), trace_id.clone(), Protocol::Redis)
+            .await;
+
+        let info = correlator.get_connection_info(&conn_id).await;
+        assert_eq!(info, Some((trace_id, Protocol::Redis)));
+
+        // Unknown connection returns None
+        let unknown = correlator.get_connection_info("unknown:1234").await;
+        assert_eq!(unknown, None);
     }
 }

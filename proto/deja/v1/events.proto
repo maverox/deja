@@ -96,6 +96,7 @@ message NonDeterministicEvent {
         uint64 time_capture_ns = 1;
         uint64 random_seed_capture = 2;
         string uuid_capture = 3;
+        string task_spawn_capture = 4;
     }
 }
 

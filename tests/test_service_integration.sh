@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Starting Connector Service Integration Test..."
+echo "🚀 Starting Test Service Integration Test..."
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,13 +11,13 @@ RECORDINGS_DIR="$PROJECT_ROOT/recordings"
 # Clean up
 echo "🧹 Cleaning up previous runs..."
 docker compose -f "$PROJECT_ROOT/docker-compose.yml" down -v 2>/dev/null || true
-rm -rf "$RECORDINGS_DIR"/*.bin "$RECORDINGS_DIR"/sessions/ 2>/dev/null || true
-killall connector-service 2>/dev/null || true
+rm -rf "$RECORDINGS_DIR"/*.bin "$RECORDINGS_DIR"/*.jsonl "$RECORDINGS_DIR"/sessions/ 2>/dev/null || true
+killall test-service 2>/dev/null || true
 
-# Build connector-service
-echo "🔨 Building connector-service..."
+# Build test-service
+echo "🔨 Building test-service..."
 cd "$PROJECT_ROOT"
-cargo build --release --package connector-service
+cargo build --release --package test-service
 
 # Start Docker environment
 echo "🐳 Starting Docker services (Redis, Postgres, Deja Proxies)..."
@@ -39,66 +39,63 @@ echo "════════════════════════�
 echo "📹 PHASE 1: RECORDING MODE"
 echo "═══════════════════════════════════════════════════════════════════════"
 
-# Start connector-service pointing to Deja proxies
-echo "🚀 Starting connector-service (RECORD mode)..."
+# Start test-service pointing to Deja proxies
+echo "🚀 Starting test-service (RECORD mode)..."
 POSTGRES_HOST=localhost \
 POSTGRES_PORT=5433 \
 REDIS_HOST=localhost \
 REDIS_PORT=6390 \
 DEJA_CONTROL_HOST=localhost \
 DEJA_CONTROL_PORT=9999 \
-RUST_LOG=connector_service=info,deja_core=debug \
-"$PROJECT_ROOT/target/release/connector-service" &
+DEJA_STORAGE_FORMAT=json \
+RUST_LOG=test_service=info,deja_core=debug \
+"$PROJECT_ROOT/target/release/test-service" 2>&1 | sed "s/^/[SERVICE] /" &
 CONNECTOR_PID=$!
 sleep 3
 
-# Check if connector-service started
+# Check if test-service started
 if ! kill -0 $CONNECTOR_PID 2>/dev/null; then
-    echo "❌ connector-service failed to start"
+    echo "❌ test-service failed to start"
     docker compose -f "$PROJECT_ROOT/docker-compose.yml" logs
     exit 1
 fi
-echo "✅ connector-service running (PID: $CONNECTOR_PID)"
-
-# Health check
-echo "🔍 Health check..."
-curl -s http://localhost:3000/health && echo ""
+echo "✅ test-service running (PID: $CONNECTOR_PID)"
 
 # Send test traffic
 echo ""
 echo "📤 Sending test traffic..."
 for i in 1 2 3; do
-    echo "  Request $i:"
-    RESPONSE=$(curl -s -X POST http://localhost:3000/process \
+    echo "[TEST-SCRIPT] Sending Request $i..."
+    RESPONSE=$(curl -s -X POST http://localhost:50051/process \
         -H "Content-Type: application/json" \
         -d "{\"id\": \"test-$i\", \"data\": \"payload-$i\"}")
-    echo "    $RESPONSE"
+    echo "[TEST-SCRIPT] Response: $RESPONSE"
     sleep 1
 done
 
-# Stop connector-service
+# Stop test-service
 echo ""
-echo "🛑 Stopping connector-service..."
+echo "🛑 Stopping test-service..."
 kill $CONNECTOR_PID 2>/dev/null || true
 wait $CONNECTOR_PID 2>/dev/null || true
 
 # Check recordings
 echo ""
 echo "🔍 Verifying recordings..."
-RECORDING_COUNT=$(find "$RECORDINGS_DIR" -name "*.bin" 2>/dev/null | wc -l | tr -d ' ')
+RECORDING_COUNT=$(find "$RECORDINGS_DIR" -name "events.jsonl" 2>/dev/null | wc -l | tr -d ' ')
 echo "   Found $RECORDING_COUNT recording files."
 
 if [ "$RECORDING_COUNT" -lt 1 ]; then
-    echo "❌ No recordings found. Check Deja Proxy logs:"
-    docker compose -f "$PROJECT_ROOT/docker-compose.yml" logs deja-postgres deja-redis
+    echo "❌ No recordings found. Check Docker logs:"
+    docker compose -f "$PROJECT_ROOT/docker-compose.yml" logs
     exit 1
 fi
 echo "✅ Recordings verified!"
 
-# List session directories
+# Show the recording
 echo ""
-echo "📁 Session directories:"
-ls -la "$RECORDINGS_DIR"/sessions/ 2>/dev/null || echo "   (No sessions directory found)"
+echo "📄 RECORDED EVENTS (JSON):"
+find "$RECORDINGS_DIR" -name "events.jsonl" -exec cat {} + | sed "s/^/  /"
 
 # =============================================================================
 # PHASE 2: REPLAY
@@ -120,17 +117,16 @@ echo "📂 Using session: $SESSION_ID"
 echo "🛑 Stopping Docker services..."
 docker compose -f "$PROJECT_ROOT/docker-compose.yml" down
 
-# Start replay proxy manually (not via docker-compose as we need replay mode)
+# Start replay proxy manually
 echo "🚀 Starting Deja Proxy in REPLAY mode..."
 # Build proxy if not already built
 cargo build --release --package deja-proxy
 
-# Start replay proxy for Postgres (port 5434)
+# Start replay proxy for all (port 5434 for both PG and Redis in this script's simple map)
 "$PROJECT_ROOT/target/release/deja-proxy" \
-    --listen 0.0.0.0:5434 \
-    --target 0.0.0.0:0 \
+    --map 5434:0.0.0.0:0 \
     --mode replay \
-    --record-dir "$RECORDINGS_DIR" &
+    --record-dir "$RECORDINGS_DIR" 2>&1 | sed "s/^/[PROXY-REPLAY] /" &
 REPLAY_PROXY_PID=$!
 sleep 3
 
@@ -140,33 +136,33 @@ if ! kill -0 $REPLAY_PROXY_PID 2>/dev/null; then
 fi
 echo "✅ Replay proxy running (PID: $REPLAY_PROXY_PID)"
 
-# Start connector-service pointing to replay proxy
-echo "🚀 Starting connector-service (REPLAY mode)..."
+# Start test-service pointing to replay proxy
+echo "🚀 Starting test-service (REPLAY mode)..."
 POSTGRES_HOST=localhost \
 POSTGRES_PORT=5434 \
 REDIS_HOST=localhost \
 REDIS_PORT=5434 \
 DEJA_CONTROL_HOST=localhost \
 DEJA_CONTROL_PORT=9999 \
-RUST_LOG=connector_service=info,deja_core=debug \
-"$PROJECT_ROOT/target/release/connector-service" &
+RUST_LOG=test_service=info,deja_core=debug \
+"$PROJECT_ROOT/target/release/test-service" 2>&1 | sed "s/^/[SERVICE] /" &
 CONNECTOR_REPLAY_PID=$!
 sleep 3
 
 if ! kill -0 $CONNECTOR_REPLAY_PID 2>/dev/null; then
-    echo "❌ connector-service (replay) failed to start"
+    echo "❌ test-service (replay) failed to start"
     kill $REPLAY_PROXY_PID 2>/dev/null || true
     exit 1
 fi
-echo "✅ connector-service running in replay mode (PID: $CONNECTOR_REPLAY_PID)"
+echo "✅ test-service running in replay mode (PID: $CONNECTOR_REPLAY_PID)"
 
 # Replay the same traffic
 echo ""
 echo "📤 Replaying test traffic..."
 REPLAY_SUCCESS=true
 for i in 1 2 3; do
-    echo "  Replay Request $i:"
-    RESPONSE=$(curl -s -X POST http://localhost:3000/process \
+    echo "[TEST-SCRIPT] Replaying Request $i..."
+    RESPONSE=$(curl -s -X POST http://localhost:50051/process \
         -H "Content-Type: application/json" \
         -d "{\"id\": \"test-$i\", \"data\": \"payload-$i\"}" || echo "CURL_FAILED")
     

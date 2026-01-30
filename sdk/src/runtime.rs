@@ -11,6 +11,7 @@
 //! In replay mode, recorded values are returned.
 
 use async_trait::async_trait;
+use deja_common::DejaRuntime;
 use std::env;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,50 +19,6 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-
-/// Trait for handling non-deterministic operations in a replay-friendly way.
-///
-/// Services should use this trait instead of directly calling `Uuid::new_v4()`,
-/// `SystemTime::now()`, etc. to enable deterministic replay.
-#[async_trait]
-pub trait DejaRuntime: Send + Sync {
-    /// Generate a UUID v4
-    async fn uuid(&self) -> Uuid;
-
-    /// Generate a UUID v7 (time-ordered)
-    async fn uuid_v7(&self) -> Uuid;
-
-    /// Get current system time
-    async fn now(&self) -> SystemTime;
-
-    /// Get current time as milliseconds since epoch
-    async fn now_millis(&self) -> u64;
-
-    /// Generate a random u64
-    async fn random_u64(&self) -> u64;
-
-    /// Generate random bytes
-    async fn random_bytes(&self, len: usize) -> Vec<u8>;
-
-    /// Generate a nanoid (default 21 chars, alphanumeric)
-    async fn nanoid(&self) -> String;
-
-    /// Record a non-deterministic value with a tag.
-    /// In production mode: no-op
-    /// In recording mode: sends value to proxy for storage
-    async fn capture(&self, tag: &str, value: &str);
-
-    /// Replay a recorded value by tag.
-    /// In production mode: returns None
-    /// In replay mode: returns the recorded value
-    async fn replay(&self, tag: &str) -> Option<String>;
-
-    /// Set the trace ID for correlating captures with requests.
-    fn set_trace_id(&self, trace_id: String);
-
-    /// Get the current trace ID.
-    fn get_trace_id(&self) -> String;
-}
 
 /// Helper function for deterministic execution with any runtime.
 ///
@@ -193,6 +150,10 @@ impl DejaRuntime for ProductionRuntime {
     fn get_trace_id(&self) -> String {
         String::new()
     }
+
+    fn control_client(&self) -> crate::control_api::ControlClient {
+        crate::control_api::ControlClient::new("localhost", 9999)
+    }
 }
 
 // ============================================================================
@@ -285,13 +246,8 @@ impl NetworkRuntime {
     /// GET a replayed value from the proxy
     async fn replay_internal(&self, kind: &str) -> Option<String> {
         let trace = self.trace_id();
-        let resp = self
-            .client
-            .get(format!("{}/replay", self.proxy_url))
-            .query(&[("trace_id", &trace), ("kind", &kind.to_string())])
-            .send()
-            .await
-            .ok()?;
+        let url = format!("{}/replay?trace_id={}&kind={}", self.proxy_url, trace, kind);
+        let resp = self.client.get(url).send().await.ok()?;
 
         let replay_resp: ReplayResponse = resp.json().await.ok()?;
         if replay_resp.found {
@@ -428,6 +384,19 @@ impl DejaRuntime for NetworkRuntime {
     fn get_trace_id(&self) -> String {
         self.trace_id.read().unwrap().clone()
     }
+
+    fn control_client(&self) -> crate::control_api::ControlClient {
+        let (host, port) = parse_proxy_url(&self.proxy_url);
+        crate::control_api::ControlClient::new(&host, port)
+    }
+}
+
+fn parse_proxy_url(url: &str) -> (String, u16) {
+    let stripped = url.replace("http://", "").replace("https://", "");
+    let parts: Vec<&str> = stripped.split(':').collect();
+    let host = parts[0].to_string();
+    let port = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(9999);
+    (host, port)
 }
 
 impl DejaAsyncBoundary for NetworkRuntime {
@@ -489,6 +458,16 @@ pub fn get_runtime_arc() -> Arc<dyn DejaRuntime> {
     match mode.as_str() {
         "record" | "replay" => Arc::new(NetworkRuntime::from_env()),
         _ => Arc::new(ProductionRuntime::new()),
+    }
+}
+
+/// Get a NetworkRuntime specifically (for spawn() access via DejaAsyncBoundary)
+/// Returns None in production mode
+pub fn get_network_runtime() -> Option<Arc<NetworkRuntime>> {
+    let mode = env::var("DEJA_MODE").unwrap_or_else(|_| "production".into());
+    match mode.as_str() {
+        "record" | "replay" => Some(Arc::new(NetworkRuntime::from_env())),
+        _ => None,
     }
 }
 

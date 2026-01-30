@@ -73,10 +73,35 @@ impl ConnectionParser for HttpConnectionParser {
                     );
                 }
 
-                // Consume the buffer
+                let host = header_map
+                    .get("Host")
+                    .or_else(|| header_map.get("host"))
+                    .cloned()
+                    .unwrap_or_default();
+
+                // Check for Content-Length
+                let content_length = header_map
+                    .get("Content-Length")
+                    .or_else(|| header_map.get("content-length"))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+
+                // Consume the head
+                // Status::Complete(len) gives us the length of the HEAD (request line + headers)
+                if self.client_buf.len() < len + content_length {
+                    // We have the head, but not the full body yet
+                    return Ok(ParseResult {
+                        events: vec![],
+                        forward: Bytes::copy_from_slice(data),
+                        needs_more: true,
+                        reply: None,
+                    });
+                }
+
                 let _head = self.client_buf.split_to(len);
-                let body = self.client_buf.to_vec();
-                self.client_buf.clear();
+                let body = self.client_buf.split_to(content_length).to_vec();
+                // We do NOT clear the buffer here blindly, strictly split what we need.
+                // Any remaining bytes are for the next request (pipeline).
 
                 // Construct Protobuf Event
                 let event = RecordedEvent {
@@ -94,7 +119,7 @@ impl ConnectionParser for HttpConnectionParser {
                         headers: header_map,
                         body,
                         schema: "http".to_string(),
-                        host: "".to_string(), // TODO extract from headers
+                        host, // Extracted from headers
                     })),
                     ..Default::default()
                 };
@@ -190,6 +215,8 @@ impl ConnectionParser for HttpConnectionParser {
         self.client_buf.clear();
         self.server_buf.clear();
     }
+
+    fn set_mode(&mut self, _is_replay: bool) {}
 }
 
 pub struct HttpSerializer;

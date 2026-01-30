@@ -51,7 +51,11 @@ impl EventHasher {
                                 // Check if this is EX or PX (TTL modifier)
                                 if let Ok(s) = std::str::from_utf8(b) {
                                     let upper = s.to_uppercase();
-                                    if upper == "EX" || upper == "PX" || upper == "EXAT" || upper == "PXAT" {
+                                    if upper == "EX"
+                                        || upper == "PX"
+                                        || upper == "EXAT"
+                                        || upper == "PXAT"
+                                    {
                                         skip_next_ttl = true;
                                     }
                                 }
@@ -60,7 +64,11 @@ impl EventHasher {
                             crate::events::redis_value::Kind::SimpleString(s) => {
                                 // Check if this is EX or PX (TTL modifier)
                                 let upper = s.to_uppercase();
-                                if upper == "EX" || upper == "PX" || upper == "EXAT" || upper == "PXAT" {
+                                if upper == "EX"
+                                    || upper == "PX"
+                                    || upper == "EXAT"
+                                    || upper == "PXAT"
+                                {
                                     skip_next_ttl = true;
                                 }
                                 s.hash(&mut hasher);

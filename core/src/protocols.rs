@@ -38,6 +38,11 @@ pub trait ProtocolParser: Send + Sync {
 
     /// Create a new connection state machine
     fn new_connection(&self, connection_id: String) -> Box<dyn ConnectionParser>;
+
+    /// Optional: Get initial bytes to send to client when starting a replay connection
+    fn on_replay_init(&self) -> Option<Bytes> {
+        None
+    }
 }
 
 /// State machine for a single connection
@@ -52,4 +57,9 @@ pub trait ConnectionParser: Send {
     fn connection_id(&self) -> &str;
 
     fn reset(&mut self);
+
+    /// Set whether the connection is in replay mode.
+    /// Used by parsers that need to generate replies (e.g. HTTP/2 ACKs)
+    /// only in replay mode.
+    fn set_mode(&mut self, is_replay: bool);
 }

@@ -6,6 +6,8 @@ use crate::events::{
 };
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use fallible_iterator::FallibleIterator;
+use postgres_protocol::message::backend;
 use std::str;
 
 pub struct PostgresParser;
@@ -135,26 +137,17 @@ impl ConnectionParser for PostgresConnectionParser {
 
             match self.state {
                 PgState::Startup => {
-                    // Check startup packet
-                    // We need at least length
                     if self.client_buf.len() < 4 {
                         break;
                     }
-
-                    // Check for SSL or GSSENC Request (Length 8, Version 80877103 or 80877104)
                     if self.client_buf.len() >= 8 {
                         let len_peek =
                             u32::from_be_bytes(self.client_buf[0..4].try_into().unwrap());
                         let ver_peek =
                             u32::from_be_bytes(self.client_buf[4..8].try_into().unwrap());
                         if len_peek == 8 && (ver_peek == 80877103 || ver_peek == 80877104) {
-                            println!(
-                                "[Postgres] Denying SSL/GSSENC request (version: {})",
-                                ver_peek
-                            );
-                            // Consume the Request
+                            // SSL/GSSENC
                             let _ = self.client_buf.split_to(8);
-                            // Return 'N' to deny
                             return Ok(ParseResult {
                                 events: vec![],
                                 forward: Bytes::new(),
@@ -164,12 +157,7 @@ impl ConnectionParser for PostgresConnectionParser {
                         }
                     }
 
-                    // For Phase 3 MVP, simplistic parsing without robust version checking
                     if let Some(startup) = Self::parse_startup(&mut self.client_buf) {
-                        println!(
-                            "[Postgres] Parsed Startup message: user={}, db={}",
-                            startup.user, startup.database
-                        );
                         events.push(RecordedEvent {
                             trace_id: uuid::Uuid::new_v4().to_string(), // Correlation
                             span_id: uuid::Uuid::new_v4().to_string(),
@@ -184,139 +172,92 @@ impl ConnectionParser for PostgresConnectionParser {
                         self.sequence += 1;
                         self.state = PgState::Normal;
                     } else {
-                        if !self.client_buf.is_empty() {
-                            println!(
-                                "[Postgres] Failed to parse startup from {} bytes",
-                                self.client_buf.len()
-                            );
+                        let len = (&self.client_buf[0..4]).get_u32() as usize;
+                        if self.client_buf.len() + 4 < len {
+                            break;
                         }
-                        break; // need more data
+                        break;
                     }
                 }
                 PgState::Normal => {
-                    // 1 byte tag, 4 byte len
+                    // Manual Frontend Parsing
                     if self.client_buf.len() < 5 {
                         break;
                     }
                     let tag = self.client_buf[0];
-                    let len = (&self.client_buf[1..5]).get_u32() as usize;
-
-                    if self.client_buf.len() < 1 + len {
+                    let len_total = (&self.client_buf[1..5]).get_u32() as usize;
+                    // Length includes self (4 bytes), so total frame is 1 + len_total.
+                    // But wait, get_u32 advances? No, &self.client_buf[1..5] is a slice.
+                    let required = 1 + len_total;
+                    if self.client_buf.len() < required {
                         break;
                     }
 
-                    let _ = self.client_buf.split_to(1); // consume tag
-                    let _ = self.client_buf.get_u32(); // consume len
-                    let body_len = len - 4;
-                    let mut body = self.client_buf.split_to(body_len);
+                    // Consume frame
+                    let mut frame = self.client_buf.split_to(required);
+                    frame.advance(5); // skip tag (1) and len (4)
+                    let mut body = frame;
 
-                    match tag {
+                    let message = match tag {
                         b'Q' => {
-                            let query_str = read_null_term_string(&mut body);
-                            events.push(RecordedEvent {
-                                trace_id: uuid::Uuid::new_v4().to_string(),
-                                span_id: uuid::Uuid::new_v4().to_string(),
-                                timestamp_ns: now_ns(),
-                                event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                                    message: Some(pg_message_event::Message::Query(PgQuery {
-                                        query: query_str,
-                                    })),
-                                })),
-                                sequence: self.sequence,
-                                connection_id: self.connection_id.clone(),
-                                ..Default::default()
-                            });
-                            self.sequence += 1;
+                            // Query
+                            let query = read_null_term_string(&mut body);
+                            // Wait, read_null_term_string takes &mut BytesMut. body is Bytes (from slice off check? No BytesMut::split_to returns BytesMut).
+                            // Ah, `slice` returns `BytesMut` if `frame` is `BytesMut`. Yes.
+                            Some(pg_message_event::Message::Query(PgQuery { query }))
                         }
                         b'P' => {
-                            // Parse: name, query, num_params, param_types
+                            // Parse
                             let name = read_null_term_string(&mut body);
                             let query = read_null_term_string(&mut body);
                             let num_params = body.get_u16();
                             let mut param_types = Vec::new();
                             for _ in 0..num_params {
-                                if body.len() >= 4 {
-                                    param_types.push(body.get_u32());
-                                }
+                                param_types.push(body.get_u32());
                             }
-                            events.push(RecordedEvent {
-                                trace_id: uuid::Uuid::new_v4().to_string(),
-                                span_id: uuid::Uuid::new_v4().to_string(),
-                                timestamp_ns: now_ns(),
-                                event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                                    message: Some(pg_message_event::Message::Parse(PgParse {
-                                        query,
-                                        name,
-                                        param_types,
-                                    })),
-                                })),
-                                sequence: self.sequence,
-                                connection_id: self.connection_id.clone(),
-                                ..Default::default()
-                            });
-                            self.sequence += 1;
+                            Some(pg_message_event::Message::Parse(PgParse {
+                                name,
+                                query,
+                                param_types,
+                            }))
                         }
                         b'B' => {
-                            // Bind: portal, statement, ...
+                            // Bind
                             let portal = read_null_term_string(&mut body);
                             let statement = read_null_term_string(&mut body);
-                            events.push(RecordedEvent {
-                                trace_id: uuid::Uuid::new_v4().to_string(),
-                                span_id: uuid::Uuid::new_v4().to_string(),
-                                timestamp_ns: now_ns(),
-                                event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                                    message: Some(pg_message_event::Message::Bind(PgBind {
-                                        portal,
-                                        statement,
-                                    })),
-                                })),
-                                sequence: self.sequence,
-                                connection_id: self.connection_id.clone(),
-                                ..Default::default()
-                            });
-                            self.sequence += 1;
+                            // Skip formats, values, result formats for now (complex)
+                            Some(pg_message_event::Message::Bind(PgBind {
+                                portal,
+                                statement,
+                            }))
                         }
                         b'E' => {
-                            // Execute: portal, max_rows
+                            // Execute
                             let portal = read_null_term_string(&mut body);
                             let max_rows = body.get_u32();
-                            events.push(RecordedEvent {
-                                trace_id: uuid::Uuid::new_v4().to_string(),
-                                span_id: uuid::Uuid::new_v4().to_string(),
-                                timestamp_ns: now_ns(),
-                                event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                                    message: Some(pg_message_event::Message::Execute(PgExecute {
-                                        portal,
-                                        max_rows,
-                                    })),
-                                })),
-                                sequence: self.sequence,
-                                connection_id: self.connection_id.clone(),
-                                ..Default::default()
-                            });
-                            self.sequence += 1;
+                            Some(pg_message_event::Message::Execute(PgExecute {
+                                portal,
+                                max_rows,
+                            }))
                         }
-                        b'S' => {
-                            // Sync
-                            events.push(RecordedEvent {
-                                trace_id: uuid::Uuid::new_v4().to_string(),
-                                span_id: uuid::Uuid::new_v4().to_string(),
-                                timestamp_ns: now_ns(),
-                                event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                                    message: Some(pg_message_event::Message::Sync(
-                                        PgSimpleResponse {},
-                                    )),
-                                })),
-                                sequence: self.sequence,
-                                connection_id: self.connection_id.clone(),
-                                ..Default::default()
-                            });
-                            self.sequence += 1;
-                        }
-                        b'X' => {
-                            // Terminate
-                        }
-                        _ => {}
+                        b'S' => Some(pg_message_event::Message::Sync(PgSimpleResponse {})),
+                        b'X' => None, // Terminate
+                        _ => None,    // Unknown
+                    };
+
+                    if let Some(msg) = message {
+                        events.push(RecordedEvent {
+                            trace_id: uuid::Uuid::new_v4().to_string(),
+                            span_id: uuid::Uuid::new_v4().to_string(),
+                            timestamp_ns: now_ns(),
+                            event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
+                                message: Some(msg),
+                            })),
+                            sequence: self.sequence,
+                            connection_id: self.connection_id.clone(),
+                            ..Default::default()
+                        });
+                        self.sequence += 1;
                     }
                 }
             }
@@ -339,34 +280,16 @@ impl ConnectionParser for PostgresConnectionParser {
                 break;
             }
 
-            if self.server_buf.len() < 5 {
-                break;
-            }
-            let tag = self.server_buf[0];
-            let len = (&self.server_buf[1..5]).get_u32() as usize;
-
-            if self.server_buf.len() < 1 + len {
-                break;
-            }
-
-            let _ = self.server_buf.split_to(1); // tag
-            let _ = self.server_buf.get_u32(); // len (includes self)
-            let body_len = len - 4;
-            let mut body = self.server_buf.split_to(body_len);
-
-            match tag {
-                b'R' => {
-                    // Authentication
-                    let auth_type = body.get_u32();
-                    if auth_type == 0 {
+            // Using backend::Message::parse
+            match backend::Message::parse(&mut self.server_buf) {
+                Ok(Some(msg)) => {
+                    if let Some(event_msg) = map_backend_message(msg) {
                         events.push(RecordedEvent {
                             trace_id: uuid::Uuid::new_v4().to_string(),
                             span_id: uuid::Uuid::new_v4().to_string(),
                             timestamp_ns: now_ns(),
                             event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                                message: Some(pg_message_event::Message::AuthenticationOk(
-                                    PgSimpleResponse {},
-                                )),
+                                message: Some(event_msg),
                             })),
                             sequence: self.sequence,
                             connection_id: self.connection_id.clone(),
@@ -375,204 +298,10 @@ impl ConnectionParser for PostgresConnectionParser {
                         self.sequence += 1;
                     }
                 }
-                b'S' => {
-                    // ParameterStatus
-                    let name = read_null_term_string(&mut body);
-                    let value = read_null_term_string(&mut body);
-                    events.push(RecordedEvent {
-                        trace_id: uuid::Uuid::new_v4().to_string(),
-                        span_id: uuid::Uuid::new_v4().to_string(),
-                        timestamp_ns: now_ns(),
-                        event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                            message: Some(pg_message_event::Message::ParameterStatus(
-                                PgParameterStatus { name, value },
-                            )),
-                        })),
-                        sequence: self.sequence,
-                        connection_id: self.connection_id.clone(),
-                        ..Default::default()
-                    });
-                    self.sequence += 1;
-                }
-                b'K' => {
-                    // BackendKeyData
-                    if body.len() >= 8 {
-                        let process_id = body.get_u32();
-                        let secret_key = body.get_u32();
-                        events.push(RecordedEvent {
-                            trace_id: uuid::Uuid::new_v4().to_string(),
-                            span_id: uuid::Uuid::new_v4().to_string(),
-                            timestamp_ns: now_ns(),
-                            event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                                message: Some(pg_message_event::Message::BackendKeyData(
-                                    PgBackendKeyData {
-                                        process_id,
-                                        secret_key,
-                                    },
-                                )),
-                            })),
-                            sequence: self.sequence,
-                            connection_id: self.connection_id.clone(),
-                            ..Default::default()
-                        });
-                        self.sequence += 1;
-                    }
-                }
-                b'Z' => {
-                    // ReadyForQuery
-                    if !body.is_empty() {
-                        let status = (body.get_u8() as char).to_string();
-                        events.push(RecordedEvent {
-                            trace_id: uuid::Uuid::new_v4().to_string(),
-                            span_id: uuid::Uuid::new_v4().to_string(),
-                            timestamp_ns: now_ns(),
-                            event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                                message: Some(pg_message_event::Message::ReadyForQuery(
-                                    PgReadyForQuery { status },
-                                )),
-                            })),
-                            sequence: self.sequence,
-                            connection_id: self.connection_id.clone(),
-                            ..Default::default()
-                        });
-                        self.sequence += 1;
-                    }
-                }
-                b'1' => {
-                    // ParseComplete
-                    events.push(RecordedEvent {
-                        trace_id: uuid::Uuid::new_v4().to_string(),
-                        span_id: uuid::Uuid::new_v4().to_string(),
-                        timestamp_ns: now_ns(),
-                        event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                            message: Some(pg_message_event::Message::ParseComplete(
-                                PgSimpleResponse {},
-                            )),
-                        })),
-                        sequence: self.sequence,
-                        connection_id: self.connection_id.clone(),
-                        ..Default::default()
-                    });
-                    self.sequence += 1;
-                }
-                b'2' => {
-                    // BindComplete
-                    events.push(RecordedEvent {
-                        trace_id: uuid::Uuid::new_v4().to_string(),
-                        span_id: uuid::Uuid::new_v4().to_string(),
-                        timestamp_ns: now_ns(),
-                        event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                            message: Some(pg_message_event::Message::BindComplete(
-                                PgSimpleResponse {},
-                            )),
-                        })),
-                        sequence: self.sequence,
-                        connection_id: self.connection_id.clone(),
-                        ..Default::default()
-                    });
-                    self.sequence += 1;
-                }
-                b'T' => {
-                    // RowDescription
-                    if body.len() < 2 {
-                        continue;
-                    }
-                    let count = body.get_u16();
-                    let mut fields = Vec::with_capacity(count as usize);
-
-                    for _ in 0..count {
-                        let name = read_null_term_string(&mut body);
-                        if body.len() < 18 {
-                            break;
-                        } // TableOID(4)+ColAttr(2)+TypeOID(4)+TypeLen(2)+TypeMod(4)+Format(2) = 18
-                        let table_oid = body.get_u32();
-                        let _col_attr = body.get_u16();
-                        let type_oid = body.get_u32();
-                        let _type_len = body.get_i16();
-                        let _type_mod = body.get_u32();
-                        let _format = body.get_i16();
-
-                        fields.push(crate::events::PgColumn {
-                            name,
-                            table_oid,
-                            type_oid,
-                        });
-                    }
-
-                    events.push(RecordedEvent {
-                        trace_id: uuid::Uuid::new_v4().to_string(),
-                        span_id: uuid::Uuid::new_v4().to_string(),
-                        timestamp_ns: now_ns(),
-                        event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                            message: Some(pg_message_event::Message::RowDesc(
-                                crate::events::PgRowDescription { fields },
-                            )),
-                        })),
-                        sequence: self.sequence,
-                        connection_id: self.connection_id.clone(),
-                        ..Default::default()
-                    });
-                    self.sequence += 1;
-                }
-                b'D' => {
-                    // DataRow
-                    if body.len() < 2 {
-                        continue;
-                    }
-                    let count = body.get_u16();
-                    let mut values = Vec::with_capacity(count as usize);
-
-                    for _ in 0..count {
-                        if body.len() < 4 {
-                            break;
-                        }
-                        let val_len = body.get_i32();
-                        if val_len == -1 {
-                            // NULL
-                            values.push(vec![]);
-                        } else {
-                            let val_len_u = val_len as usize;
-                            if body.len() < val_len_u {
-                                break;
-                            }
-                            let val_bytes = body.split_to(val_len_u);
-                            values.push(val_bytes.to_vec());
-                        }
-                    }
-
-                    events.push(RecordedEvent {
-                        trace_id: uuid::Uuid::new_v4().to_string(),
-                        span_id: uuid::Uuid::new_v4().to_string(),
-                        timestamp_ns: now_ns(),
-                        event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                            message: Some(pg_message_event::Message::DataRow(PgDataRow { values })),
-                        })),
-                        sequence: self.sequence,
-                        connection_id: self.connection_id.clone(),
-                        ..Default::default()
-                    });
-                    self.sequence += 1;
-                }
-                b'C' => {
-                    // CommandComplete
-                    let tag = read_null_term_string(&mut body);
-                    events.push(RecordedEvent {
-                        trace_id: uuid::Uuid::new_v4().to_string(),
-                        span_id: uuid::Uuid::new_v4().to_string(),
-                        timestamp_ns: now_ns(),
-                        event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
-                            message: Some(pg_message_event::Message::CommandComplete(
-                                PgCommandComplete { tag },
-                            )),
-                        })),
-                        sequence: self.sequence,
-                        connection_id: self.connection_id.clone(),
-                        ..Default::default()
-                    });
-                    self.sequence += 1;
-                }
-                _ => {
-                    // Ignore other messages (error E, etc for now)
+                Ok(None) => break,
+                Err(e) => {
+                    println!("[Postgres] Backend Parse error: {:?}", e);
+                    break;
                 }
             }
         }
@@ -594,6 +323,73 @@ impl ConnectionParser for PostgresConnectionParser {
         self.server_buf.clear();
         self.state = PgState::Startup;
         self.sequence = 0;
+    }
+
+    fn set_mode(&mut self, _is_replay: bool) {}
+}
+
+// Map only backend messages as we manually parse frontend
+fn map_backend_message(msg: backend::Message) -> Option<pg_message_event::Message> {
+    match msg {
+        backend::Message::AuthenticationOk => Some(pg_message_event::Message::AuthenticationOk(
+            PgSimpleResponse {},
+        )),
+        backend::Message::ParameterStatus(b) => Some(pg_message_event::Message::ParameterStatus(
+            PgParameterStatus {
+                name: b.name().ok()?.to_string(),
+                value: b.value().ok()?.to_string(),
+            },
+        )),
+        backend::Message::BackendKeyData(b) => Some(pg_message_event::Message::BackendKeyData(
+            PgBackendKeyData {
+                process_id: b.process_id() as u32,
+                secret_key: b.secret_key() as u32,
+            },
+        )),
+        backend::Message::ReadyForQuery(b) => {
+            Some(pg_message_event::Message::ReadyForQuery(PgReadyForQuery {
+                status: (b.status() as char).to_string(),
+            }))
+        }
+        backend::Message::ParseComplete => Some(pg_message_event::Message::ParseComplete(
+            PgSimpleResponse {},
+        )),
+        backend::Message::BindComplete => {
+            Some(pg_message_event::Message::BindComplete(PgSimpleResponse {}))
+        }
+        backend::Message::RowDescription(b) => {
+            let mut fields = Vec::new();
+            let mut iter = b.fields();
+            while let Ok(Some(f)) = iter.next() {
+                fields.push(crate::events::PgColumn {
+                    name: f.name().to_string(),
+                    table_oid: f.table_oid(),
+                    type_oid: f.type_oid(),
+                });
+            }
+            Some(pg_message_event::Message::RowDesc(
+                crate::events::PgRowDescription { fields },
+            ))
+        }
+        backend::Message::DataRow(b) => {
+            let mut values = Vec::new();
+            // Use ranges() + buffer() for data row access
+            let mut iter = b.ranges();
+            while let Ok(Some(range)) = iter.next() {
+                if let Some(r) = range {
+                    values.push(b.buffer()[r].to_vec());
+                } else {
+                    values.push(vec![]);
+                }
+            }
+            Some(pg_message_event::Message::DataRow(PgDataRow { values }))
+        }
+        backend::Message::CommandComplete(b) => Some(pg_message_event::Message::CommandComplete(
+            PgCommandComplete {
+                tag: b.tag().ok()?.to_string(),
+            },
+        )),
+        _ => None,
     }
 }
 
@@ -728,18 +524,6 @@ impl PgSerializer {
         buf.put_u16(row.values.len() as u16);
         for val in &row.values {
             if val.is_empty() {
-                // Check if it's NULL or empty string?
-                // RecordedEvent data might not distinguish well if I just used `vec![]` for NULL in parsing.
-                // In parse: `if val_len == -1 { values.push(vec![]); }`
-                // So empty vec is NULL? Wait, empty string is 0 length bytes.
-                // This is an ambiguity in my recording logic.
-                // I should fix the parser to record NULL state properly, maybe `Option<bytes>`.
-                // But sticking to Phase 5 plan: Let's assume non-null empty strings for now or -1.
-                // Standard PG: -1 is null.
-
-                // If I want to be safe, I'll just write 0 length for now (empty string) unless I change the proto.
-                // But NULL is common.
-                // Let's output -1 (NULL) if empty, creating potential issue for empty strings, but safer for "no data".
                 buf.put_i32(-1);
             } else {
                 buf.put_i32(val.len() as i32);

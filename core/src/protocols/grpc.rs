@@ -1,3 +1,4 @@
+
 //! gRPC protocol parser for Deja proxy
 //!
 //! gRPC uses HTTP/2 as transport with Protocol Buffers for serialization.
@@ -19,7 +20,7 @@ use crate::events::{
     recorded_event, GrpcCallType, GrpcRequestEvent, GrpcResponseEvent, RecordedEvent,
 };
 use async_trait::async_trait;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use framing::{parse_grpc_path, GrpcFrame, GRPC_HEADER_SIZE};
 use std::collections::HashMap;
 
@@ -49,7 +50,8 @@ impl ProtocolParser for GrpcParser {
         // Check for HTTP/2 frame format (for mid-connection detection)
         // HTTP/2 frames start with: length (3 bytes) + type (1 byte) + flags (1 byte) + stream_id (4 bytes)
         if peek.len() >= 9 {
-            let frame_length = ((peek[0] as u32) << 16) | ((peek[1] as u32) << 8) | (peek[2] as u32);
+            let frame_length =
+                ((peek[0] as u32) << 16) | ((peek[1] as u32) << 8) | (peek[2] as u32);
             let frame_type = peek[3];
             let _stream_id = u32::from_be_bytes([peek[5] & 0x7F, peek[6], peek[7], peek[8]]);
 
@@ -70,6 +72,14 @@ impl ProtocolParser for GrpcParser {
 
     fn new_connection(&self, connection_id: String) -> Box<dyn ConnectionParser> {
         Box::new(GrpcConnectionParser::new(connection_id))
+    }
+
+    fn on_replay_init(&self) -> Option<Bytes> {
+        // Send a basic HTTP/2 SETTINGS frame
+        // length=0, type=0x04 (SETTINGS), flags=0, stream_id=0
+        Some(Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]))
     }
 }
 
@@ -159,6 +169,8 @@ struct StreamState {
     start_time_ns: u64,
     /// Whether we've emitted the request event
     request_emitted: bool,
+    /// Trace ID extracted from request headers (for correlation)
+    trace_id: Option<String>,
 }
 
 /// Connection-level parser for gRPC (HTTP/2)
@@ -173,6 +185,13 @@ pub struct GrpcConnectionParser {
     preface_seen: bool,
     /// Pending events to emit
     pending_events: Vec<RecordedEvent>,
+    /// HPACK decoders for both directions
+    client_decoder: hpack::Decoder<'static>,
+    server_decoder: hpack::Decoder<'static>,
+    /// Replies to send back to client (e.g. SETTINGS ACK)
+    pending_replies: Vec<Bytes>,
+    /// Whether the connection is in replay mode
+    is_replay: bool,
 }
 
 impl GrpcConnectionParser {
@@ -185,6 +204,10 @@ impl GrpcConnectionParser {
             streams: HashMap::new(),
             preface_seen: false,
             pending_events: Vec::new(),
+            client_decoder: hpack::Decoder::new(),
+            server_decoder: hpack::Decoder::new(),
+            pending_replies: Vec::new(),
+            is_replay: false,
         }
     }
 
@@ -228,7 +251,11 @@ impl GrpcConnectionParser {
     }
 
     /// Handle a single HTTP/2 frame from the client
-    fn handle_client_frame(&mut self, header: &H2FrameHeader, payload: &[u8]) -> Result<(), ParseError> {
+    fn handle_client_frame(
+        &mut self,
+        header: &H2FrameHeader,
+        payload: &[u8],
+    ) -> Result<(), ParseError> {
         match header.frame_type {
             H2FrameType::Headers => {
                 self.handle_client_headers(header.stream_id, header.flags, payload)?;
@@ -236,27 +263,64 @@ impl GrpcConnectionParser {
             H2FrameType::Data => {
                 self.handle_client_data(header.stream_id, header.flags, payload)?;
             }
-            H2FrameType::Settings | H2FrameType::WindowUpdate | H2FrameType::Ping => {
-                // Connection-level frames, no action needed for gRPC parsing
+            H2FrameType::Settings => {
+                // If this is not an ACK, we should reply with a SETTINGS ACK
+                let is_ack = (header.flags & 0x01) != 0;
+                if !is_ack && self.is_replay {
+                    // Send SETTINGS ACK
+                    let mut ack = BytesMut::with_capacity(9);
+                    ack.put_u32(0); // length=0 (3 bytes) + type=0x04 (1 byte)
+                    ack[3] = 0x04;
+                    ack.put_u8(0x01); // flags=ACK
+                    ack.put_u32(0); // stream_id=0
+
+                    self.pending_replies.push(ack.freeze());
+                }
+            }
+            H2FrameType::Ping => {
+                if self.is_replay {
+                    // Return PING ACK with same payload
+                    let mut ack = BytesMut::with_capacity(9 + payload.len());
+                    let len = payload.len() as u32;
+                    ack.put_u8((len >> 16) as u8);
+                    ack.put_u8((len >> 8) as u8);
+                    ack.put_u8(len as u8);
+                    ack.put_u8(0x06); // type=PING
+                    ack.put_u8(0x01); // flags=ACK
+                    ack.put_u32(0); // stream_id=0
+                    ack.extend_from_slice(payload);
+
+                    self.pending_replies.push(ack.freeze());
+                }
             }
             _ => {
-                // Other frames: Priority, RstStream, etc.
+                // Other frames: Priority, RstStream, WindowUpdate, etc.
             }
         }
         Ok(())
     }
 
     /// Handle HEADERS frame from client (request headers)
-    fn handle_client_headers(&mut self, stream_id: u32, flags: u8, payload: &[u8]) -> Result<(), ParseError> {
+    fn handle_client_headers(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<(), ParseError> {
         let state = self.streams.entry(stream_id).or_default();
         state.start_time_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        // Parse HPACK-encoded headers (simplified - in production use h2 crate)
-        // For now, we'll do a best-effort extraction of key headers
-        parse_headers_simple(payload, &mut state.request_metadata);
+        // Parse HPACK-encoded headers
+        if let Ok(headers) = self.client_decoder.decode(payload) {
+            for (name, value) in headers {
+                let name_str = String::from_utf8_lossy(&name).to_string();
+                let value_str = String::from_utf8_lossy(&value).to_string();
+                state.request_metadata.insert(name_str, value_str);
+            }
+        }
 
         // Extract service and method from :path
         if let Some(path) = state.request_metadata.get(":path") {
@@ -264,6 +328,15 @@ impl GrpcConnectionParser {
                 state.service = service;
                 state.method = method;
             }
+        }
+
+        // Extract trace ID from headers for correlation (check both x-trace-id and x-request-id)
+        if state.trace_id.is_none() {
+            state.trace_id = state
+                .request_metadata
+                .get("x-trace-id")
+                .or_else(|| state.request_metadata.get("x-request-id"))
+                .cloned();
         }
 
         // END_HEADERS flag (0x04) indicates headers are complete
@@ -278,7 +351,12 @@ impl GrpcConnectionParser {
     }
 
     /// Handle DATA frame from client (request body)
-    fn handle_client_data(&mut self, stream_id: u32, flags: u8, payload: &[u8]) -> Result<(), ParseError> {
+    fn handle_client_data(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<(), ParseError> {
         if let Some(state) = self.streams.get_mut(&stream_id) {
             state.request_body.extend_from_slice(payload);
 
@@ -315,7 +393,11 @@ impl GrpcConnectionParser {
     }
 
     /// Handle a single HTTP/2 frame from the server
-    fn handle_server_frame(&mut self, header: &H2FrameHeader, payload: &[u8]) -> Result<(), ParseError> {
+    fn handle_server_frame(
+        &mut self,
+        header: &H2FrameHeader,
+        payload: &[u8],
+    ) -> Result<(), ParseError> {
         match header.frame_type {
             H2FrameType::Headers => {
                 self.handle_server_headers(header.stream_id, header.flags, payload)?;
@@ -329,16 +411,27 @@ impl GrpcConnectionParser {
     }
 
     /// Handle HEADERS frame from server (response headers or trailers)
-    fn handle_server_headers(&mut self, stream_id: u32, flags: u8, payload: &[u8]) -> Result<(), ParseError> {
+    fn handle_server_headers(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<(), ParseError> {
         if let Some(state) = self.streams.get_mut(&stream_id) {
             let end_stream = (flags & 0x01) != 0;
 
-            if state.response_metadata.is_empty() {
-                // First HEADERS = response headers
-                parse_headers_simple(payload, &mut state.response_metadata);
-            } else {
-                // Subsequent HEADERS = trailers
-                parse_headers_simple(payload, &mut state.response_trailers);
+            if let Ok(headers) = self.server_decoder.decode(payload) {
+                let target = if state.response_metadata.is_empty() {
+                    &mut state.response_metadata
+                } else {
+                    &mut state.response_trailers
+                };
+
+                for (name, value) in headers {
+                    let name_str = String::from_utf8_lossy(&name).to_string();
+                    let value_str = String::from_utf8_lossy(&value).to_string();
+                    target.insert(name_str, value_str);
+                }
             }
 
             if end_stream {
@@ -349,7 +442,12 @@ impl GrpcConnectionParser {
     }
 
     /// Handle DATA frame from server (response body)
-    fn handle_server_data(&mut self, stream_id: u32, flags: u8, payload: &[u8]) -> Result<(), ParseError> {
+    fn handle_server_data(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<(), ParseError> {
         if let Some(state) = self.streams.get_mut(&stream_id) {
             state.response_body.extend_from_slice(payload);
 
@@ -377,7 +475,16 @@ impl GrpcConnectionParser {
         let request_metadata = state.request_metadata.clone();
         let request_body_raw = state.request_body.clone();
         let start_time_ns = state.start_time_ns;
-        let authority = state.request_metadata.get(":authority").cloned().unwrap_or_default();
+        let authority = state
+            .request_metadata
+            .get(":authority")
+            .cloned()
+            .unwrap_or_default();
+        // Use extracted trace_id or fallback to a new UUID
+        let trace_id = state
+            .trace_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         // Mark as emitted
         if let Some(state) = self.streams.get_mut(&stream_id) {
@@ -388,7 +495,7 @@ impl GrpcConnectionParser {
         let request_body = extract_grpc_message(&request_body_raw);
 
         let event = RecordedEvent {
-            trace_id: uuid::Uuid::new_v4().to_string(),
+            trace_id,
             span_id: uuid::Uuid::new_v4().to_string(),
             sequence: self.sequence,
             timestamp_ns: start_time_ns,
@@ -420,6 +527,11 @@ impl GrpcConnectionParser {
         let response_body_raw = state.response_body.clone();
         let response_metadata = state.response_metadata.clone();
         let response_trailers = state.response_trailers.clone();
+        // Reuse the trace_id from the request for correlation
+        let trace_id = state
+            .trace_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -442,7 +554,7 @@ impl GrpcConnectionParser {
         let response_body = extract_grpc_message(&response_body_raw);
 
         let event = RecordedEvent {
-            trace_id: uuid::Uuid::new_v4().to_string(),
+            trace_id,
             span_id: uuid::Uuid::new_v4().to_string(),
             sequence: self.sequence,
             timestamp_ns: now_ns,
@@ -471,12 +583,21 @@ impl ConnectionParser for GrpcConnectionParser {
         self.parse_client_frames()?;
 
         let events = std::mem::take(&mut self.pending_events);
+        let reply = if self.pending_replies.is_empty() {
+            None
+        } else {
+            let mut buf = BytesMut::new();
+            for r in std::mem::take(&mut self.pending_replies) {
+                buf.extend_from_slice(&r);
+            }
+            Some(buf.freeze())
+        };
 
         Ok(ParseResult {
             events,
             forward: Bytes::copy_from_slice(data),
             needs_more: false,
-            reply: None,
+            reply,
         })
     }
 
@@ -485,12 +606,21 @@ impl ConnectionParser for GrpcConnectionParser {
         self.parse_server_frames()?;
 
         let events = std::mem::take(&mut self.pending_events);
+        let reply = if self.pending_replies.is_empty() {
+            None
+        } else {
+            let mut buf = BytesMut::new();
+            for r in std::mem::take(&mut self.pending_replies) {
+                buf.extend_from_slice(&r);
+            }
+            Some(buf.freeze())
+        };
 
         Ok(ParseResult {
             events,
             forward: Bytes::copy_from_slice(data),
             needs_more: false,
-            reply: None,
+            reply,
         })
     }
 
@@ -505,115 +635,13 @@ impl ConnectionParser for GrpcConnectionParser {
         self.preface_seen = false;
         self.pending_events.clear();
     }
+
+    fn set_mode(&mut self, is_replay: bool) {
+        self.is_replay = is_replay;
+    }
 }
 
 pub use serializer::GrpcSerializer;
-
-/// Simplified header parsing - in production, use proper HPACK decoder
-fn parse_headers_simple(payload: &[u8], headers: &mut HashMap<String, String>) {
-    // This is a simplified parser that looks for common patterns
-    // Real implementation should use h2's HPACK decoder
-    // For now, we'll try to extract literal headers
-
-    let mut pos = 0;
-    while pos < payload.len() {
-        // Check for literal header field with incremental indexing (0x40)
-        // or literal header field without indexing (0x00 with prefix)
-        let byte = payload[pos];
-
-        if byte & 0xC0 == 0x40 || byte & 0xF0 == 0x00 {
-            // Try to parse as literal header
-            if let Some((name, value, consumed)) = try_parse_literal_header(&payload[pos..]) {
-                headers.insert(name, value);
-                pos += consumed;
-                continue;
-            }
-        }
-
-        // Skip unknown bytes
-        pos += 1;
-    }
-}
-
-/// Try to parse a literal header from HPACK data
-fn try_parse_literal_header(data: &[u8]) -> Option<(String, String, usize)> {
-    if data.is_empty() {
-        return None;
-    }
-
-    let mut pos = 0;
-    let first_byte = data[pos];
-    pos += 1;
-
-    // Check for literal header with indexing (0x40 prefix) or without (0x00 prefix)
-    let name_index = if first_byte & 0xC0 == 0x40 {
-        first_byte & 0x3F
-    } else if first_byte & 0xF0 == 0x00 {
-        first_byte & 0x0F
-    } else {
-        return None;
-    };
-
-    let name = if name_index == 0 {
-        // Literal name
-        if pos >= data.len() {
-            return None;
-        }
-        let name_len_byte = data[pos];
-        let huffman = (name_len_byte & 0x80) != 0;
-        let name_len = (name_len_byte & 0x7F) as usize;
-        pos += 1;
-
-        if pos + name_len > data.len() {
-            return None;
-        }
-
-        if huffman {
-            // Huffman encoded - skip for now
-            let _ = pos + name_len;
-            return None;
-        }
-
-        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
-        pos += name_len;
-        name
-    } else {
-        // Indexed name - common headers
-        match name_index {
-            1 => ":authority",
-            2 => ":method",
-            3 => ":path",
-            4 => ":scheme",
-            5 => ":status",
-            _ => return None,
-        }
-        .to_string()
-    };
-
-    // Parse value
-    if pos >= data.len() {
-        return None;
-    }
-    let value_len_byte = data[pos];
-    let huffman = (value_len_byte & 0x80) != 0;
-    let value_len = (value_len_byte & 0x7F) as usize;
-    pos += 1;
-
-    if pos + value_len > data.len() {
-        return None;
-    }
-
-    if huffman {
-        // Huffman encoded - skip for now
-        let _ = pos + value_len;
-        return None;
-    }
-
-    let value = String::from_utf8_lossy(&data[pos..pos + value_len]).to_string();
-    let _ = pos + value_len;
-
-    Some((name, value, pos))
-}
 
 /// Extract the gRPC message body from framed data
 fn extract_grpc_message(data: &BytesMut) -> Vec<u8> {

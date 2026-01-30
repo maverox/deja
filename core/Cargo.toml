@@ -17,27 +17,37 @@ async-trait = "0.1"
 bincode = "1.3"
 rand = "0.8"
 
+# Shared types
+deja-common = { path = "../common" }
+
 # Protobuf support
 prost = "0.12"
 prost-types = "0.12"
 
 # TLS support
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.13"
 rustls-pemfile = "2.1"
 tokio-rustls = "0.26"
+webpki-roots = "0.26"
+x509-parser = "0.16"
+time = "0.3"
 
 # HTTP client for NetworkRuntime
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # gRPC/HTTP2 support
 h2 = "0.4"
+hpack = "0.3"
 
 # Configuration parsing
 toml = "0.8"
 
 # Pattern matching for filters
 glob = "0.3"
+redis-protocol = { version = "6.0.0", features = ["bytes"] }
+postgres-protocol = "0.6.10"
+fallible-iterator = "0.2"
 
 [build-dependencies]
 prost-build = "0.12"

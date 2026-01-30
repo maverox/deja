@@ -29,8 +29,12 @@
 //! )).await?;
 //! ```
 
-pub mod protocol;
-pub mod client;
+pub mod protocol {
+    pub use deja_common::control::ControlMessage;
+    pub use deja_common::control::ControlResponse;
+}
+pub mod client {
+    pub use deja_common::control::ControlClient;
+}
 
-pub use protocol::{ControlMessage, ControlResponse};
-pub use client::ControlClient;
+pub use deja_common::control::*;

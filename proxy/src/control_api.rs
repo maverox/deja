@@ -281,128 +281,240 @@ async fn handle_orchestrate(
         }
     };
 
-    // Serialize trigger to HTTP request bytes
-    let request_bytes = match engine.serialize_http_request(&trigger) {
-        Some(b) => b,
-        None => {
-            let response = OrchestrateResponse {
-                pass: false,
-                trace_id: orch_req.trace_id,
-                message: "Failed to serialize trigger request".to_string(),
-                status_diff: None,
-            };
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(Response::new(Full::new(Bytes::from(json))));
-        }
-    };
+    // Determine trigger type and handle accordingly
+    let is_grpc = engine.is_grpc_trigger(&trigger);
 
-    // Extract path and method from trigger for HTTP request
-    let (method, path, _headers, _body_bytes) = match &trigger.event {
-        Some(recorded_event::Event::HttpRequest(req)) => (
-            req.method.clone(),
-            req.path.clone(),
-            req.headers.clone(),
-            req.body.clone(),
-        ),
-        _ => {
-            let response = OrchestrateResponse {
-                pass: false,
-                trace_id: orch_req.trace_id,
-                message: "Trigger is not an HTTP request".to_string(),
-                status_diff: None,
-            };
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(Response::new(Full::new(Bytes::from(json))));
-        }
-    };
-
-    // Drop engine lock before making HTTP request
+    // Drop engine lock before making request
     drop(engine);
 
-    // Build URL
-    let url = format!("{}{}", orch_req.service_url.trim_end_matches('/'), path);
-    println!("[Orchestrate] Sending {} {} to service", method, url);
-
-    // Send request to service using raw TCP (to match exactly)
-    // Parse service URL
-    let parsed_url = match url::Url::parse(&url) {
-        Ok(u) => u,
-        Err(e) => {
-            let response = OrchestrateResponse {
-                pass: false,
-                trace_id: orch_req.trace_id,
-                message: format!("Invalid service URL: {}", e),
-                status_diff: None,
-            };
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(Response::new(Full::new(Bytes::from(json))));
-        }
-    };
-
-    let host = parsed_url.host_str().unwrap_or("localhost");
-    let port = parsed_url.port().unwrap_or(80);
-    let addr = format!("{}:{}", host, port);
-
-    // Connect to service
-    let mut stream = match tokio::net::TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            let response = OrchestrateResponse {
-                pass: false,
-                trace_id: orch_req.trace_id,
-                message: format!("Failed to connect to service: {}", e),
-                status_diff: None,
-            };
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(Response::new(Full::new(Bytes::from(json))));
-        }
-    };
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Send the raw request bytes
-    if let Err(e) = stream.write_all(&request_bytes).await {
-        let response = OrchestrateResponse {
-            pass: false,
-            trace_id: orch_req.trace_id,
-            message: format!("Failed to send request: {}", e),
-            status_diff: None,
+    if is_grpc {
+        // ========== gRPC Trigger Flow ==========
+        let engine = engine_lock.lock().await;
+        let (service, method, request_body) = match engine.get_grpc_request_info(&trigger) {
+            Some(info) => info,
+            None => {
+                let response = OrchestrateResponse {
+                    pass: false,
+                    trace_id: orch_req.trace_id,
+                    message: "Failed to extract gRPC request info".to_string(),
+                    status_diff: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(Response::new(Full::new(Bytes::from(json))));
+            }
         };
-        let json = serde_json::to_string(&response).unwrap_or_default();
-        return Ok(Response::new(Full::new(Bytes::from(json))));
-    }
+        drop(engine);
 
-    // Read response
-    let mut response_buf = vec![0u8; 65536];
-    let n = match stream.read(&mut response_buf).await {
-        Ok(n) => n,
-        Err(e) => {
+        // Build gRPC path: /{service}/{method}
+        let grpc_path = format!("/{}/{}", service, method);
+        let url = format!(
+            "{}{}",
+            orch_req.service_url.trim_end_matches('/'),
+            grpc_path
+        );
+        println!("[Orchestrate] Sending gRPC request to {}", url);
+
+        // For gRPC we need to use a proper HTTP/2 client
+        // Build raw HTTP/2 request with gRPC framing
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        // gRPC uses length-prefixed framing: 1 byte compressed flag + 4 bytes length + message
+        let mut framed_body = Vec::with_capacity(5 + request_body.len());
+        framed_body.push(0); // Not compressed
+        framed_body.extend_from_slice(&(request_body.len() as u32).to_be_bytes());
+        framed_body.extend_from_slice(&request_body);
+
+        let grpc_response = match client
+            .post(&url)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(framed_body)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let response = OrchestrateResponse {
+                    pass: false,
+                    trace_id: orch_req.trace_id,
+                    message: format!("Failed to send gRPC request: {}", e),
+                    status_diff: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(Response::new(Full::new(Bytes::from(json))));
+            }
+        };
+
+        // Get grpc-status from trailers (if available) or headers
+        let grpc_status = grpc_response
+            .headers()
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        let body_bytes = match grpc_response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let response = OrchestrateResponse {
+                    pass: false,
+                    trace_id: orch_req.trace_id,
+                    message: format!("Failed to read gRPC response: {}", e),
+                    status_diff: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(Response::new(Full::new(Bytes::from(json))));
+            }
+        };
+
+        // Skip gRPC framing (5 bytes: 1 compressed flag + 4 bytes length)
+        let response_body = if body_bytes.len() > 5 {
+            &body_bytes[5..]
+        } else {
+            &body_bytes[..]
+        };
+
+        // Compare responses
+        let engine = engine_lock.lock().await;
+        let result = engine.compare_grpc_responses(&expected, response_body, grpc_status);
+
+        let orch_response = OrchestrateResponse {
+            pass: result.pass,
+            trace_id: orch_req.trace_id,
+            message: result.message,
+            status_diff: result.diff.and_then(|d| d.status_diff),
+        };
+
+        let json = serde_json::to_string(&orch_response).unwrap_or_default();
+        Ok(Response::new(Full::new(Bytes::from(json))))
+    } else {
+        // ========== HTTP Trigger Flow ==========
+        let engine = engine_lock.lock().await;
+        let request_bytes = match engine.serialize_http_request(&trigger) {
+            Some(b) => b,
+            None => {
+                let response = OrchestrateResponse {
+                    pass: false,
+                    trace_id: orch_req.trace_id,
+                    message: "Failed to serialize trigger request".to_string(),
+                    status_diff: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(Response::new(Full::new(Bytes::from(json))));
+            }
+        };
+
+        // Extract path and method from trigger for HTTP request
+        let (method, path, _headers, _body_bytes) = match &trigger.event {
+            Some(recorded_event::Event::HttpRequest(req)) => (
+                req.method.clone(),
+                req.path.clone(),
+                req.headers.clone(),
+                req.body.clone(),
+            ),
+            _ => {
+                let response = OrchestrateResponse {
+                    pass: false,
+                    trace_id: orch_req.trace_id,
+                    message: "Trigger is not an HTTP request".to_string(),
+                    status_diff: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(Response::new(Full::new(Bytes::from(json))));
+            }
+        };
+
+        // Drop engine lock before making HTTP request
+        drop(engine);
+
+        // Build URL
+        let url = format!("{}{}", orch_req.service_url.trim_end_matches('/'), path);
+        println!("[Orchestrate] Sending {} {} to service", method, url);
+
+        // Send request to service using raw TCP (to match exactly)
+        // Parse service URL
+        let parsed_url = match url::Url::parse(&url) {
+            Ok(u) => u,
+            Err(e) => {
+                let response = OrchestrateResponse {
+                    pass: false,
+                    trace_id: orch_req.trace_id,
+                    message: format!("Invalid service URL: {}", e),
+                    status_diff: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(Response::new(Full::new(Bytes::from(json))));
+            }
+        };
+
+        let host = parsed_url.host_str().unwrap_or("localhost");
+        let port = parsed_url.port().unwrap_or(80);
+        let addr = format!("{}:{}", host, port);
+
+        // Connect to service
+        let mut stream = match tokio::net::TcpStream::connect(&addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                let response = OrchestrateResponse {
+                    pass: false,
+                    trace_id: orch_req.trace_id,
+                    message: format!("Failed to connect to service: {}", e),
+                    status_diff: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(Response::new(Full::new(Bytes::from(json))));
+            }
+        };
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Send the raw request bytes
+        if let Err(e) = stream.write_all(&request_bytes).await {
             let response = OrchestrateResponse {
                 pass: false,
                 trace_id: orch_req.trace_id,
-                message: format!("Failed to read response: {}", e),
+                message: format!("Failed to send request: {}", e),
                 status_diff: None,
             };
             let json = serde_json::to_string(&response).unwrap_or_default();
             return Ok(Response::new(Full::new(Bytes::from(json))));
         }
-    };
 
-    let actual_response = &response_buf[..n];
+        // Read response
+        let mut response_buf = vec![0u8; 65536];
+        let n = match stream.read(&mut response_buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                let response = OrchestrateResponse {
+                    pass: false,
+                    trace_id: orch_req.trace_id,
+                    message: format!("Failed to read response: {}", e),
+                    status_diff: None,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(Response::new(Full::new(Bytes::from(json))));
+            }
+        };
 
-    // Compare responses
-    let engine = engine_lock.lock().await;
-    let result = engine.compare_responses(&expected, actual_response);
+        let actual_response = &response_buf[..n];
 
-    let orch_response = OrchestrateResponse {
-        pass: result.pass,
-        trace_id: orch_req.trace_id,
-        message: result.message,
-        status_diff: result.diff.and_then(|d| d.status_diff),
-    };
+        // Compare responses
+        let engine = engine_lock.lock().await;
+        let result = engine.compare_responses(&expected, actual_response);
 
-    let json = serde_json::to_string(&orch_response).unwrap_or_default();
-    Ok(Response::new(Full::new(Bytes::from(json))))
+        let orch_response = OrchestrateResponse {
+            pass: result.pass,
+            trace_id: orch_req.trace_id,
+            message: result.message,
+            status_diff: result.diff.and_then(|d| d.status_diff),
+        };
+
+        let json = serde_json::to_string(&orch_response).unwrap_or_default();
+        Ok(Response::new(Full::new(Bytes::from(json))))
+    }
 }
 
 async fn handle_list_traces(
@@ -491,16 +603,31 @@ async fn handle_control_connection(
         ControlMessage::AssociateConnection {
             trace_id,
             connection_id,
+            protocol,
             ..
         } => {
-            println!(
-                "[Correlation] Associating connection {} with trace {}",
-                connection_id, trace_id
-            );
-            state
-                .correlator
-                .associate_connection(connection_id, trace_id)
-                .await;
+            match protocol {
+                Some(proto) => {
+                    println!(
+                        "[Correlation] Associating connection {} with trace {} (protocol: {})",
+                        connection_id, trace_id, proto
+                    );
+                    state
+                        .correlator
+                        .associate_connection_with_protocol(connection_id, trace_id, proto)
+                        .await;
+                }
+                None => {
+                    println!(
+                        "[Correlation] Associating connection {} with trace {}",
+                        connection_id, trace_id
+                    );
+                    state
+                        .correlator
+                        .associate_connection(connection_id, trace_id)
+                        .await;
+                }
+            }
             create_control_success_response()
         }
         ControlMessage::UpdateConnection {
@@ -557,6 +684,9 @@ fn create_non_deterministic_event(req: &CaptureRequest) -> Result<RecordedEvent,
                 .map_err(|_| format!("Invalid seed: {}", req.value))?;
             Some(non_deterministic_event::Kind::RandomSeedCapture(seed))
         }
+        "task_spawn" => Some(non_deterministic_event::Kind::TaskSpawnCapture(
+            req.value.clone(),
+        )),
         _ => None,
     };
 

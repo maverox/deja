@@ -2,14 +2,12 @@
 //!
 //! Provides test harness utilities for orchestrating:
 //! - Mock HTTP backends
-//! - Test gRPC server
 //! - Deja proxy (record/replay modes)
 //!
 //! Each test scenario spins up fresh instances for isolation.
 
 use std::net::TcpListener as StdTcpListener;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -23,18 +21,14 @@ pub fn get_available_port() -> u16 {
 pub struct TestHarness {
     /// Mock backend port
     pub mock_backend_port: u16,
-    /// Test server gRPC port  
-    pub test_server_port: u16,
     /// Proxy listen port
     pub proxy_port: u16,
     /// Proxy control API port
     pub control_api_port: u16,
     /// Recordings directory
     pub recordings_dir: tempfile::TempDir,
-    /// Proxy process (if started externally)
+    /// Proxy process (if started)
     proxy_process: Option<Child>,
-    /// Test server process (if started externally)
-    test_server_process: Option<Child>,
 }
 
 impl TestHarness {
@@ -42,12 +36,10 @@ impl TestHarness {
     pub fn new() -> Self {
         Self {
             mock_backend_port: get_available_port(),
-            test_server_port: get_available_port(),
             proxy_port: get_available_port(),
             control_api_port: get_available_port(),
             recordings_dir: tempfile::tempdir().unwrap(),
             proxy_process: None,
-            test_server_process: None,
         }
     }
 
@@ -64,9 +56,12 @@ impl TestHarness {
     }
 
     /// Start the proxy in recording mode
+    /// Uses --map format: PROXY_PORT:TARGET_HOST:TARGET_PORT
     pub async fn start_proxy_record(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let recordings_path = self.recordings_dir.path().to_str().unwrap();
-        let target_addr = format!("127.0.0.1:{}", self.mock_backend_port);
+
+        // Format: PROXY_PORT:TARGET_HOST:TARGET_PORT
+        let map_arg = format!("{}:127.0.0.1:{}", self.proxy_port, self.mock_backend_port);
 
         let child = Command::new("cargo")
             .args([
@@ -74,10 +69,8 @@ impl TestHarness {
                 "-p",
                 "deja-proxy",
                 "--",
-                "--listen",
-                &format!("0.0.0.0:{}", self.proxy_port),
-                "--target",
-                &target_addr,
+                "--map",
+                &map_arg,
                 "--mode",
                 "record",
                 "--record-dir",
@@ -91,8 +84,12 @@ impl TestHarness {
 
         self.proxy_process = Some(child);
 
-        // Wait for proxy to be ready
-        sleep(Duration::from_secs(2)).await;
+        // Wait for proxy to be ready (compile + start)
+        sleep(Duration::from_secs(3)).await;
+
+        // Verify proxy is listening
+        self.wait_for_proxy().await?;
+
         Ok(())
     }
 
@@ -100,16 +97,17 @@ impl TestHarness {
     pub async fn start_proxy_replay(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let recordings_path = self.recordings_dir.path().to_str().unwrap();
 
+        // In replay mode, target is ignored but we still need to provide the map
+        let map_arg = format!("{}:127.0.0.1:{}", self.proxy_port, self.mock_backend_port);
+
         let child = Command::new("cargo")
             .args([
                 "run",
                 "-p",
                 "deja-proxy",
                 "--",
-                "--listen",
-                &format!("0.0.0.0:{}", self.proxy_port),
-                "--target",
-                "0.0.0.0:0", // Ignored in replay mode
+                "--map",
+                &map_arg,
                 "--mode",
                 "replay",
                 "--record-dir",
@@ -124,8 +122,22 @@ impl TestHarness {
         self.proxy_process = Some(child);
 
         // Wait for proxy to be ready
-        sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(3)).await;
+
+        self.wait_for_proxy().await?;
+
         Ok(())
+    }
+
+    /// Wait for proxy to be ready by checking if the port is open
+    async fn wait_for_proxy(&self) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..20 {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", self.proxy_port)).is_ok() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+        Err("Proxy did not start in time".into())
     }
 
     /// Stop the proxy
@@ -141,12 +153,12 @@ impl TestHarness {
         self.recordings_dir.path()
     }
 
-    /// URL for the mock backend
+    /// URL for the mock backend (direct, bypassing proxy)
     pub fn mock_backend_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.mock_backend_port)
     }
 
-    /// URL for the proxy
+    /// URL for the proxy (requests go through here)
     pub fn proxy_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.proxy_port)
     }
@@ -155,15 +167,18 @@ impl TestHarness {
     pub fn control_api_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.control_api_port)
     }
+
+    /// Count recording files in the recordings directory
+    pub fn count_recordings(&self) -> usize {
+        std::fs::read_dir(self.recordings_path())
+            .map(|entries| entries.filter(|e| e.is_ok()).count())
+            .unwrap_or(0)
+    }
 }
 
 impl Drop for TestHarness {
     fn drop(&mut self) {
         self.stop_proxy();
-        if let Some(mut child) = self.test_server_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }
 
@@ -171,13 +186,4 @@ impl Default for TestHarness {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Test result struct for assertions
-#[derive(Debug)]
-pub struct TestResult {
-    pub success: bool,
-    pub message: String,
-    pub recordings_count: usize,
-    pub replay_matched: bool,
 }
