@@ -1,7 +1,7 @@
 use crate::events::RecordedEvent;
 use std::path::PathBuf;
 use tokio::fs;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt}; // Import AsyncSeekExt
+use tokio::io::AsyncWriteExt;
 
 pub struct Recorder {
     base_path: PathBuf,
@@ -55,30 +55,9 @@ impl Recorder {
             .open(&filename)
             .await?;
 
-        // Get current offset for indexing
-        let offset = file.seek(std::io::SeekFrom::End(0)).await?;
-
         file.write_all(&payload).await?;
-
-        // Write Index
-        // Only index Requests (optimization?) or everything?
-        // Hash calculation is cheap, let's index everything for simplicity of mapping 1:1.
-        use crate::hash::EventHasher;
-        let hash = EventHasher::calculate_hash(event);
-
-        let index_file = session_dir.join("index.bin");
-        let mut idx_f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&index_file)
-            .await?;
-
-        // Index Entry: [Hash(u64)][Offset(u64)]
-        let mut idx_buf = Vec::with_capacity(16);
-        idx_buf.extend_from_slice(&hash.to_be_bytes());
-        idx_buf.extend_from_slice(&offset.to_be_bytes());
-
-        idx_f.write_all(&idx_buf).await?;
+        file.flush().await?;
+        file.sync_all().await?;
 
         Ok(())
     }

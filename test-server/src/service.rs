@@ -12,8 +12,8 @@ use crate::test_service::{
     EchoRequest, EchoResponse, GenerateIdRequest, GenerateIdResponse, MultiBackendRequest,
     MultiBackendResponse, Scenario,
 };
-use deja_sdk::get_runtime;
-use std::time::Instant;
+use deja_sdk::{deja_run, get_runtime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 
@@ -51,7 +51,12 @@ impl TestService for TestServiceImpl {
 
         // Get timestamp using Deja runtime (for deterministic replay)
         let runtime = get_runtime();
-        let timestamp_ms = runtime.now_millis().await;
+        let timestamp_ms: u64 = deja_run(&*runtime, "timestamp", || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        }).await;
 
         // Make HTTP call to backend
         let backend_url = if req.backend_url.is_empty() {
@@ -95,13 +100,18 @@ impl TestService for TestServiceImpl {
         let runtime = get_runtime();
 
         let uuid = if req.generate_uuid {
-            runtime.uuid().await.to_string()
+            deja_run(&*runtime, "uuid", || uuid::Uuid::new_v4()).await.to_string()
         } else {
             String::new()
         };
 
         let timestamp_ms = if req.generate_timestamp {
-            runtime.now_millis().await as i64
+            deja_run(&*runtime, "timestamp", || {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            }).await as i64
         } else {
             0
         };
@@ -112,7 +122,13 @@ impl TestService for TestServiceImpl {
             } else {
                 16
             };
-            runtime.random_bytes(count).await
+            deja_run(&*runtime, &format!("random_bytes:{}", count), move || {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                let mut bytes = vec![0u8; count];
+                rng.fill(&mut bytes[..]);
+                bytes
+            }).await
         } else {
             Vec::new()
         };
@@ -259,7 +275,10 @@ impl TestService for TestServiceImpl {
             Scenario::RandomFailure => {
                 // Use Deja runtime for deterministic randomness
                 let runtime = get_runtime();
-                let random = runtime.random_bytes(1).await;
+                let random: Vec<u8> = deja_run(&*runtime, "random_failure", || {
+                    use rand::Rng;
+                    vec![rand::thread_rng().gen::<u8>()]
+                }).await;
                 if random.first().map(|b| b % 2 == 0).unwrap_or(false) {
                     Err(Status::internal("Random failure"))
                 } else {

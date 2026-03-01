@@ -3,9 +3,12 @@
 //! Provides a Tower Layer and Service that automatically:
 //! 1. Extracts or generates a trace ID.
 //! 2. Notifies the Proxy via Control API on request start/end.
-//! 3. Manages the `with_trace_id` scope for the duration of the request.
+//! 3. Manages full trace context for the duration of the request.
 
-use crate::{generate_trace_id, get_runtime_arc, with_trace_id, ControlMessage, DejaRuntime};
+use crate::{
+    current_task_id, generate_trace_id, get_runtime, with_trace_context, ControlMessage,
+    DejaRuntime,
+};
 use axum::{body::Body, extract::Request, response::Response};
 use futures::future::BoxFuture;
 use std::task::{Context, Poll};
@@ -55,24 +58,27 @@ where
             .map(|s| s.to_string())
             .unwrap_or_else(generate_trace_id);
 
-        let runtime = get_runtime_arc();
+        let runtime = get_runtime();
 
         Box::pin(async move {
             info!(trace_id = %trace_id, "Starting Deja-instrumented request");
 
-            // 2. Notify Proxy of trace start
-            let control_client = DejaRuntime::control_client(runtime.as_ref());
-            control_client
-                .send_best_effort(ControlMessage::start_trace(&trace_id))
-                .await;
+            let res = with_trace_context(trace_id.clone(), async {
+                let control_client = DejaRuntime::control_client(runtime.as_ref());
+                let task_id = current_task_id().unwrap_or_else(|| "0".to_string());
+                control_client
+                    .send_best_effort(ControlMessage::start_trace_with_task(&trace_id, &task_id))
+                    .await;
 
-            // 3. Wrap inner service in trace context
-            let res = with_trace_id(trace_id.clone(), inner.call(req)).await;
+                let result = inner.call(req).await;
 
-            // 4. Notify Proxy of trace end (optional but good for boundaries)
-            control_client
-                .send_best_effort(ControlMessage::end_trace(&trace_id))
-                .await;
+                control_client
+                    .send_best_effort(ControlMessage::end_trace_with_task(&trace_id, &task_id))
+                    .await;
+
+                result
+            })
+            .await;
 
             res
         })

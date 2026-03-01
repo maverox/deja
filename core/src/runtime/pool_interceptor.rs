@@ -110,26 +110,14 @@ impl<T> InterceptedConnection<T> {
             connection_id: connection_id.clone(),
         };
 
-        // Notify proxy if we have a trace context
-        if let (Some(client), Some(trace_id)) =
-            (conn.control_client.as_ref(), trace_context::current_trace_id())
-        {
+        // Log trace context for debugging — in the scope model, connection
+        // re-attribution is handled by source-port association at establishment time.
+        if let Some(trace_id) = trace_context::current_trace_id() {
             debug!(
                 trace_id = %trace_id,
                 connection = %connection_id,
-                "Notifying proxy of pool connection reuse"
+                "Pool connection borrowed for trace"
             );
-
-            let msg = crate::control_api::ControlMessage::update_connection(
-                connection_id,
-                trace_id,
-            );
-
-            // Fire-and-forget: don't block connection on notification
-            let client_clone = client.clone();
-            tokio::spawn(async move {
-                let _ = client_clone.send(msg).await;
-            });
         }
 
         conn

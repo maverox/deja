@@ -1,3 +1,4 @@
+mod buffer;
 mod config;
 mod connection;
 mod control_api;
@@ -5,36 +6,31 @@ mod correlation;
 mod forward_proxy;
 
 use clap::Parser;
-use deja_core::protocols::grpc::GrpcParser;
-use deja_core::protocols::http::HttpParser;
-use deja_core::protocols::postgres::PostgresParser;
-use deja_core::protocols::redis::RedisParser;
-use deja_core::protocols::ProtocolParser;
+use deja_core::protocols::{
+    grpc::GrpcParser, http::HttpParser, postgres::PostgresParser, redis::RedisParser,
+    tcp::GenericTcpParser, ProtocolParser,
+};
 use deja_core::tls_mitm::TlsMitmManager;
 
 use deja_core::recording::Recorder;
 use deja_core::replay::{ReplayEngine, ReplayMode};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing with EnvFilter to support RUST_LOG
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_thread_ids(true)
         .with_target(false)
         .init();
 
-    // Install default crypto provider for rustls
     rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap();
 
     let args = config::Args::parse();
 
-    // Support env vars as fallback
     let mode_str = if args.mode != "record" {
         args.mode.clone()
     } else {
@@ -46,22 +42,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut maps = args.maps.clone();
     if maps.is_empty() {
-        // Try env var
         if let Ok(env_maps) = std::env::var("DEJA_PORT_MAPS") {
             maps = env_maps.split(',').map(String::from).collect();
         }
     }
 
-    // Get forward proxy port from args or env
+    let ingress_str = args
+        .ingress
+        .clone()
+        .or_else(|| std::env::var("DEJA_INGRESS").ok());
+
+    let ingress_config = ingress_str
+        .as_deref()
+        .and_then(config::IngressConfig::parse);
+
     let forward_proxy_port = args.forward_proxy_port.or_else(|| {
         std::env::var("DEJA_FORWARD_PROXY_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
     });
 
-    // At least one of maps or forward_proxy_port must be provided
-    if maps.is_empty() && forward_proxy_port.is_none() {
-        tracing::error!("No mappings or forward proxy port provided. Use --map PORT:TARGET_HOST:TARGET_PORT, --forward-proxy-port PORT, or env vars");
+    if maps.is_empty() && forward_proxy_port.is_none() && ingress_config.is_none() {
+        tracing::error!("No mappings, ingress, or forward proxy port provided. Use --map, --ingress, --forward-proxy-port, or env vars");
         std::process::exit(1);
     }
 
@@ -69,7 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting Deja Proxy in {:?} mode", mode);
     tracing::info!("Recording Directory: {}", record_dir);
 
-    // Initialize Shared State based on mode
     let recorder = match mode {
         ReplayMode::Recording => Some(Arc::new(Recorder::new(&record_dir).await)),
         _ => None,
@@ -89,20 +90,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    // Initialize trace correlator for connection tracking
     let correlator = Arc::new(correlation::TraceCorrelator::new());
-    tracing::info!("[Correlation] Initialized trace correlator");
+    tracing::info!("[Correlation] Initialized scope-based trace correlator");
 
-    // Start Control API for SDK communication
+let association_timeout_ms: u64 = std::env::var("DEJA_ASSOCIATION_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(args.association_timeout_ms);
+
+    let retro_bind_window_ms: u64 = std::env::var("DEJA_RETRO_BIND_WINDOW_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(args.retro_bind_window_ms);
+
+    // Determine replay strictness: 'strict' (fail-closed) or 'lenient' (fail-open)
+    let is_replay_strict = match std::env::var("DEJA_REPLAY_STRICT").as_deref() {
+        Ok("strict") | Ok("Strict") | Ok("STRICT") => true,
+        Ok("lenient") | Ok("Lenient") | Ok("LENIENT") => false,
+        Ok(_) | Err(_) => args.replay_strict_mode == "strict",
+    };
+
+    tracing::info!("[Config] Replay strict mode: {}", if is_replay_strict { "strict (fail-closed)" } else { "lenient (fail-open)" });
+
+    let storage_backend = std::env::var("DEJA_STORAGE_BACKEND")
+        .unwrap_or_else(|_| args.storage_backend.clone());
+    let kafka_brokers = std::env::var("DEJA_KAFKA_BROKERS")
+        .unwrap_or_else(|_| args.kafka_brokers.clone());
+    let kafka_topic_prefix = std::env::var("DEJA_KAFKA_TOPIC_PREFIX")
+        .unwrap_or_else(|_| args.kafka_topic_prefix.clone());
+
+    // Build StorageConfig based on backend selection
+    let storage_config = match storage_backend.as_str() {
+        "kafka" => deja_common::StorageConfig::Kafka {
+            brokers: kafka_brokers,
+            topic_prefix: kafka_topic_prefix,
+        },
+        _ => deja_common::StorageConfig::LocalFile {
+            base_path: record_dir.clone(),
+            format: Some(std::env::var("DEJA_STORAGE_FORMAT").unwrap_or_else(|_| "binary".to_string())),
+        },
+    };
+    tracing::info!("Storage backend: {:?}", storage_config);
+
+    // Start Control API
     let control_port = std::env::var("DEJA_CONTROL_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(args.control_port);
+    let ingress_port = ingress_config.as_ref().map(|c| c.listen_port);
 
     let control_state = Arc::new(control_api::ControlApiState {
         recorder: recorder.clone(),
         replay_engine: replay_engine.clone(),
         correlator: correlator.clone(),
+        ingress_port,
+        orchestration_mutex: tokio::sync::Mutex::new(()),
     });
 
     tokio::spawn(async move {
@@ -111,7 +153,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Initialize TLS MITM if CA cert/key provided
+    // Periodic trace cleanup
+    let cleanup_correlator = correlator.clone();
+    tokio::spawn(async move {
+        let cleanup_interval = std::time::Duration::from_secs(300);
+        let max_trace_age_ns: u64 = 600_000_000_000;
+        loop {
+            tokio::time::sleep(cleanup_interval).await;
+            cleanup_correlator
+                .cleanup_old_traces(max_trace_age_ns)
+                .await;
+            tracing::debug!("[Correlation] Cleaned up old traces");
+        }
+    });
+
+    // Initialize TLS MITM
     let tls_manager = {
         let ca_cert_path = args
             .ca_cert
@@ -159,14 +215,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let parsers: Vec<Arc<dyn ProtocolParser>> = vec![
-        Arc::new(GrpcParser), // Check for gRPC (HTTP/2) first
+        Arc::new(GrpcParser),
         Arc::new(HttpParser),
         Arc::new(PostgresParser),
         Arc::new(RedisParser),
+        Arc::new(GenericTcpParser),
     ];
     let parsers_arc = Arc::new(parsers);
 
-    // Spawn listeners
     let mut tasks = Vec::new();
 
     // Start forward proxy if configured
@@ -178,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let correlator_clone = correlator.clone();
 
             tracing::info!(
-                "[ForwardProxy] Starting forward proxy on port {} (HTTP CONNECT tunneling)",
+                "[ForwardProxy] Starting forward proxy on port {}",
                 fwd_port
             );
 
@@ -202,6 +258,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Add ingress mapping
+    if let Some(config) = ingress_config {
+        let map_str = format!(
+            "{}:{}:{}",
+            config.listen_port, config.target_host, config.target_port
+        );
+        tracing::info!("[Ingress] Configured trigger listener on {}", map_str);
+        maps.push(map_str);
+    }
+
     for map in maps {
         let parts: Vec<&str> = map.split(':').collect();
         if parts.len() != 3 {
@@ -213,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let listen_port = parts[0].to_string();
-        let target_host = parts[1].to_string(); // Own it for 'static lifetime
+        let target_host = parts[1].to_string();
         let target_port = parts[2];
 
         let listen_addr = format!("0.0.0.0:{}", listen_port);
@@ -223,12 +289,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let listener = TcpListener::bind(&listen_addr).await?;
         let recorder_clone = recorder.clone();
-        let replay_engine_clone = replay_engine.clone();
+
+        let is_ingress = ingress_port
+            .map(|p| p.to_string() == listen_port)
+            .unwrap_or(false);
+        let replay_engine_clone = if is_ingress {
+            tracing::info!(
+                "[{}] Setting up listener as INGRESS (replay disabled)",
+                listen_port
+            );
+            None
+        } else {
+            if replay_engine.is_some() {
+                tracing::info!(
+                    "[{}] Setting up listener with REPLAY ENABLED",
+                    listen_port
+                );
+            }
+            replay_engine.clone()
+        };
         let parsers_clone = parsers_arc.clone();
         let tls_manager_clone = tls_manager.clone();
         let correlator_clone = correlator.clone();
 
-        // Task for this listener
         tasks.push(tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -242,8 +325,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let tls_mgr = tls_manager_clone.clone();
                         let th = target_host.clone();
                         let corr = correlator_clone.clone();
+                        let assoc_timeout = association_timeout_ms;
 
-                        // Spawn connection handler
                         tokio::spawn(async move {
                             // Check for TLS handshake
                             if let Some(tls_manager) = &tls_mgr {
@@ -261,6 +344,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         rec,
                                         rep,
                                         corr,
+                                        addr,
+                                        assoc_timeout,
+                                        is_replay_strict,
                                     )
                                     .await
                                     {
@@ -271,8 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             // Plain connection
-                            let detected_parser =
-                                connection::detect_protocol(&client_socket, &ps).await;
+                            let detected_parser = connection::detect_protocol(&client_socket, &ps).await;
                             if let Err(e) = connection::handle_connection(
                                 client_socket,
                                 target,
@@ -280,6 +365,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 rec,
                                 rep,
                                 corr,
+                                addr,
+                                assoc_timeout,
+                                is_replay_strict,
                             )
                             .await
                             {

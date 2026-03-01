@@ -63,12 +63,8 @@ async fn test_http_parse_and_record() -> Result<(), Box<dyn std::error::Error>> 
     let saved_event: RecordedEvent = bincode::deserialize(&event_bytes)?;
     assert_eq!(saved_event.trace_id, event.trace_id);
 
-    // Also verify index was created
-    let index_path = temp_dir.path()
-        .join("sessions")
-        .join(&session_id)
-        .join("index.bin");
-    assert!(index_path.exists(), "Index file should exist");
+    // Note: index.bin is no longer created at record time — RecordingIndex
+    // is built in-memory from events during replay.
 
     Ok(())
 }

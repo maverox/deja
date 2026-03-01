@@ -1,10 +1,11 @@
 use super::RecordingIndex;
 use crate::events::{pg_message_event, recorded_event, redis_value, RecordedEvent};
-use deja_common::{Protocol, SequenceTracker};
+use deja_common::{Protocol, ScopeId, ScopeSequenceTracker};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use tokio::fs;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Mode for the proxy operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,25 +36,140 @@ impl ReplayMode {
     }
 }
 
+pub type ReplayMatch = (RecordedEvent, Vec<RecordedEvent>, Vec<bytes::Bytes>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayMatchError {
+    UnresolvedAttribution {
+        trace_id: String,
+        scope_id: String,
+    },
+}
+
+impl ReplayMatchError {
+    pub const UNRESOLVED_ATTRIBUTION_MESSAGE: &'static str = "Replay attribution unresolved";
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnresolvedAttribution { .. } => "unresolved_attribution",
+        }
+    }
+
+    pub fn stable_message(&self) -> &'static str {
+        Self::UNRESOLVED_ATTRIBUTION_MESSAGE
+    }
+}
+
+impl fmt::Display for ReplayMatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnresolvedAttribution { trace_id, scope_id } => {
+                write!(
+                    f,
+                    "{} (trace_id='{}', scope_id='{}')",
+                    self.stable_message(),
+                    trace_id,
+                    scope_id
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplayMatchError {}
+
+/// Configuration for protocol-specific matching
+pub struct MatchConfig {
+    pub http: HttpMatchConfig,
+    pub postgres: PgMatchConfig,
+    pub redis: RedisMatchConfig,
+    pub grpc: GrpcMatchConfig,
+}
+
+impl Default for MatchConfig {
+    fn default() -> Self {
+        Self {
+            http: HttpMatchConfig::default(),
+            postgres: PgMatchConfig::default(),
+            redis: RedisMatchConfig::default(),
+            grpc: GrpcMatchConfig::default(),
+        }
+    }
+}
+
+pub struct HttpMatchConfig {
+    /// Compare body content
+    pub compare_body: bool,
+    /// Compare headers (all headers compared if true)
+    pub compare_headers: bool,
+}
+
+impl Default for HttpMatchConfig {
+    fn default() -> Self {
+        Self {
+            compare_body: true,
+            compare_headers: true,
+        }
+    }
+}
+
+pub struct PgMatchConfig {
+    /// Compare query text
+    pub compare_query_text: bool,
+    /// Ignore statement names (prepared statement name variations)
+    pub ignore_statement_names: bool,
+}
+
+impl Default for PgMatchConfig {
+    fn default() -> Self {
+        Self {
+            compare_query_text: true,
+            ignore_statement_names: true,
+        }
+    }
+}
+
+pub struct RedisMatchConfig {
+    /// Tolerance for TTL values in milliseconds
+    pub ttl_tolerance_ms: u64,
+}
+
+impl Default for RedisMatchConfig {
+    fn default() -> Self {
+        Self {
+            ttl_tolerance_ms: 1000,
+        }
+    }
+}
+
+pub struct GrpcMatchConfig {
+    /// Compare request body
+    pub compare_request_body: bool,
+}
+
+impl Default for GrpcMatchConfig {
+    fn default() -> Self {
+        Self {
+            compare_request_body: true,
+        }
+    }
+}
+
 pub struct ReplayEngine {
-    /// All recordings (kept for legacy/fallback access if needed)
+    /// All recordings (kept for orchestration methods and ND value lookup)
     recordings: Vec<RecordedEvent>,
 
-    /// Indexed recordings for deterministic matching
+    /// Scope-tree indexed recordings for deterministic matching
     index: RecordingIndex,
 
-    /// Track current sequences per (trace, protocol)
-    sequence_tracker: SequenceTracker,
+    /// Track current scope_sequence per scope
+    sequence_tracker: ScopeSequenceTracker,
 
-    /// Map connection_id -> (trace_id, protocol)
-    /// In replay mode, we assign these as connections come in
-    _connection_info: HashMap<String, (String, Protocol)>,
+    /// Protocol-specific match configuration
+    match_config: MatchConfig,
 
-    /// Legacy fields
-    visited: Vec<bool>,
-    lookup: HashMap<u64, Vec<usize>>,
-    search_start: usize,
-    connection_map: HashMap<String, String>,
+    /// Cursor tracking for legacy `handle_runtime_request` (keyed by "trace_id:kind")
+    runtime_cursor: HashMap<String, usize>,
 }
 
 impl ReplayEngine {
@@ -63,349 +179,217 @@ impl ReplayEngine {
         let path = recording_path.into();
         let mut recordings = load_recordings(path).await?;
 
-        // Sort recordings by timestamp, then sequence to ensure correct global order
-        recordings.sort_by_key(|e| (e.timestamp_ns, e.sequence));
+        // Sort recordings by timestamp, then scope_sequence for correct global order
+        recordings.sort_by_key(|e| (e.timestamp_ns, e.scope_sequence));
         let len = recordings.len();
         info!("Loaded {} recordings.", len);
 
-        // Build Index
+        // Build scope-tree index
         let index = RecordingIndex::from_recordings(&recordings);
         info!("Built index with {} traces.", index.trace_count());
-
-        // Build Hash Index (Legacy/Fallback)
-        let mut lookup = HashMap::new();
-        use crate::hash::EventHasher;
-        for (i, event) in recordings.iter().enumerate() {
-            let hash = EventHasher::calculate_hash(event);
-            if hash != 0 {
-                lookup.entry(hash).or_insert_with(Vec::new).push(i);
-            }
-        }
 
         Ok(Self {
             recordings,
             index,
-            sequence_tracker: SequenceTracker::new(),
-            _connection_info: HashMap::new(),
-            visited: vec![false; len],
-            lookup,
-            search_start: 0,
-            connection_map: HashMap::new(),
+            sequence_tracker: ScopeSequenceTracker::new(),
+            match_config: MatchConfig::default(),
+            runtime_cursor: HashMap::new(),
         })
     }
 
-    /// Find match using protocol-scoped sequence or fallback to hash-based matching
+    pub fn find_match_with_responses_typed(
+        &mut self,
+        incoming: &RecordedEvent,
+    ) -> Result<Option<ReplayMatch>, ReplayMatchError> {
+        let scope_id = ScopeId::from_raw(&incoming.scope_id);
+        let unresolved = incoming.trace_id.is_empty()
+            || incoming.scope_id.is_empty()
+            || incoming.trace_id == "orphan"
+            || scope_id.is_orphan();
+
+        if unresolved {
+            return Err(ReplayMatchError::UnresolvedAttribution {
+                trace_id: incoming.trace_id.clone(),
+                scope_id: incoming.scope_id.clone(),
+            });
+        }
+
+        Ok(self.find_match_with_responses(incoming))
+    }
+
+    /// Primary replay path — scope-based deterministic matching.
     ///
-    /// The incoming event must have `trace_id` populated. Protocol detection handles the rest.
-    pub fn find_match_with_responses(
-        &mut self,
-        incoming: &RecordedEvent,
-    ) -> Option<(RecordedEvent, Vec<RecordedEvent>, Vec<bytes::Bytes>)> {
-        // 1. Try Deterministic Sequence Matching
-        let protocol = self.get_event_protocol(incoming);
+    /// The incoming event must have `trace_id` and `scope_id` populated.
+    /// Uses (trace_id, scope_id, scope_sequence) as the sole matching strategy.
+    pub fn find_match_with_responses(&mut self, incoming: &RecordedEvent) -> Option<ReplayMatch> {
+        let trace_id = &incoming.trace_id;
+        let scope_id = ScopeId::from_raw(&incoming.scope_id);
 
-        if !incoming.trace_id.is_empty() {
-            if let Some(proto) = protocol {
-                if let Some(match_result) =
-                    self.find_match_by_sequence(&incoming.trace_id, proto, incoming)
-                {
-                    return Some(match_result);
-                }
-            }
-        }
-
-        // 2. Fallback to Legacy Hash Matching (for non-deterministic events or untracked protocols)
-        self.find_match_legacy(incoming)
-    }
-
-    /// Deterministic match by (trace, protocol, sequence)
-    fn find_match_by_sequence(
-        &mut self,
-        trace_id: &str,
-        protocol: Protocol,
-        incoming: &RecordedEvent,
-    ) -> Option<(RecordedEvent, Vec<RecordedEvent>, Vec<bytes::Bytes>)> {
-        // Increment sequence for this (trace, protocol)
-        let seq = self.sequence_tracker.next_sequence(trace_id, protocol);
-
-        // Lookup in index
-        let exchange = self.index.get(trace_id, protocol, seq)?;
-
-        // Validate match (optional but recommended)
-        // We can do a strict check here to ensure we aren't drifting
-        if self.is_strict_match(incoming, &exchange.client_message) {
-            Some((
-                exchange.client_message.clone(),
-                exchange.response_events.clone(),
-                exchange.server_responses.clone(),
-            ))
-        } else {
-            // Mismatch!
-            // This is critical - sequence says we should match `exchange`, but content differs.
-            // This usually means non-determinism in the client request order or content.
+        if trace_id.is_empty() || incoming.scope_id.is_empty() {
             warn!(
-                "[Replay] Sequence mismatch! Trace: {}, Proto: {}, Seq: {}. Expected: {:?}, Got: {:?}",
-                trace_id, protocol, seq, exchange.client_message.event, incoming.event
+                "[ReplayEngine] Missing trace_id or scope_id — cannot match. trace_id={:?}, scope_id={:?}",
+                trace_id, incoming.scope_id
             );
-
-            // Should we return None and let legacy try?
-            // Or return generic error?
-            // For now, let's look ahead? No, strict sequence is strict.
-            None
+            return None;
         }
-    }
 
-    /// Legacy hash-based matching (renamed from find_match_with_responses)
-    fn find_match_legacy(
-        &mut self,
-        incoming: &RecordedEvent,
-    ) -> Option<(RecordedEvent, Vec<RecordedEvent>, Vec<bytes::Bytes>)> {
-        let idx = self.find_match_index(incoming)?;
-        self.visited[idx] = true;
-        let matched_req = self.recordings[idx].clone();
+        // Get expected sequence for this scope
+        let expected_seq = self.sequence_tracker.peek_scope_sequence(&scope_id);
 
-        let mut response_events = Vec::new();
-        let mut response_bytes = Vec::new();
-        let mut curr = idx + 1;
+        tracing::info!(
+            "[ReplayEngine] Looking for match — trace_id: {}, scope_id: {}, expected_seq: {}",
+            trace_id,
+            scope_id,
+            expected_seq
+        );
 
-        while curr < self.recordings.len() {
-            if self.visited[curr] {
-                curr += 1;
-                continue;
+        // Try exact sequence match
+        if let Some(exchange) = self.index.get_exchange(trace_id, &scope_id, expected_seq) {
+            if self.match_request(incoming, &exchange.client_message) {
+                // Commit sequence
+                self.sequence_tracker.next_scope_sequence(&scope_id);
+                tracing::info!(
+                    "[ReplayEngine] Exact sequence match at seq={}",
+                    expected_seq
+                );
+                return Some((
+                    exchange.client_message.clone(),
+                    exchange.response_events.clone(),
+                    exchange.server_responses.clone(),
+                ));
             }
+            warn!(
+                "[ReplayEngine] Sequence {} content mismatch in scope {}. Trying lookahead.",
+                expected_seq, scope_id
+            );
+        }
 
-            let candidate = &self.recordings[curr];
-
-            // If protocols don't match, or it's from a different connection, skip it
-            if candidate.connection_id != matched_req.connection_id {
-                curr += 1;
-                continue;
-            }
-
-            // Same connection. Is it a response or a new request?
-            if self.is_server_response(candidate) {
-                response_events.push(candidate.clone());
-                if let Some(bytes) = self.serialize_event(candidate) {
-                    response_bytes.push(bytes);
+        // Lookahead within same scope (handles minor reordering)
+        for offset in 1..=3 {
+            let ahead_seq = expected_seq + offset;
+            if let Some(exchange) = self.index.get_exchange(trace_id, &scope_id, ahead_seq) {
+                if self.match_request(incoming, &exchange.client_message) {
+                    tracing::info!(
+                        "[ReplayEngine] Lookahead match at seq={} (expected {})",
+                        ahead_seq,
+                        expected_seq
+                    );
+                    for _ in 0..=offset {
+                        self.sequence_tracker.next_scope_sequence(&scope_id);
+                    }
+                    return Some((
+                        exchange.client_message.clone(),
+                        exchange.response_events.clone(),
+                        exchange.server_responses.clone(),
+                    ));
                 }
-                self.visited[curr] = true;
-                curr += 1;
-            } else {
-                // Found a new client request on the SAME connection -> end of response chain
-                break;
             }
         }
 
-        Some((matched_req, response_events, response_bytes))
+        // Try legacy protocol-based lookup as last resort
+        let protocol = RecordingIndex::detect_event_protocol(incoming);
+        if protocol != Protocol::Unknown {
+            let legacy_seq = self.sequence_tracker.peek_scope_sequence(
+                &ScopeId::from_raw(&format!("legacy:{}:{}", trace_id, protocol)),
+            );
+            if let Some(exchange) = self.index.get(trace_id, protocol, legacy_seq) {
+                if self.match_request(incoming, &exchange.client_message) {
+                    self.sequence_tracker.next_scope_sequence(
+                        &ScopeId::from_raw(&format!("legacy:{}:{}", trace_id, protocol)),
+                    );
+                    tracing::info!(
+                        "[ReplayEngine] Legacy protocol match: {:?} seq={}",
+                        protocol,
+                        legacy_seq
+                    );
+                    return Some((
+                        exchange.client_message.clone(),
+                        exchange.response_events.clone(),
+                        exchange.server_responses.clone(),
+                    ));
+                }
+            }
+
+        }
+
+        warn!(
+            "[ReplayEngine] No match found for trace={}, scope={}, expected_seq={}",
+            trace_id, scope_id, expected_seq
+        );
+        None
     }
 
-    // Legacy find_match wrapper
+    /// Legacy find_match wrapper
     pub fn find_match(&mut self, incoming: &RecordedEvent) -> Option<RecordedEvent> {
         let (req, _, _) = self.find_match_with_responses(incoming)?;
         Some(req)
     }
 
-    fn is_server_response(&self, event: &RecordedEvent) -> bool {
-        match &event.event {
-            Some(recorded_event::Event::PgMessage(msg)) => match &msg.message {
-                Some(pg_message_event::Message::RowDesc(_)) => true,
-                Some(pg_message_event::Message::DataRow(_)) => true,
-                Some(pg_message_event::Message::CommandComplete(_)) => true,
-                Some(pg_message_event::Message::ErrorResponse(_)) => true,
-                Some(pg_message_event::Message::AuthenticationOk(_)) => true,
-                Some(pg_message_event::Message::ParameterStatus(_)) => true,
-                Some(pg_message_event::Message::BackendKeyData(_)) => true,
-                Some(pg_message_event::Message::ReadyForQuery(_)) => true,
-                Some(pg_message_event::Message::ParseComplete(_)) => true,
-                Some(pg_message_event::Message::BindComplete(_)) => true,
-                Some(pg_message_event::Message::NoData(_)) => true,
-                _ => false,
-            },
-            Some(recorded_event::Event::RedisResponse(_)) => true,
-            Some(recorded_event::Event::HttpResponse(_)) => true,
-            Some(recorded_event::Event::GrpcResponse(_)) => true,
-            _ => false,
-        }
-    }
-
-    fn get_event_protocol(&self, event: &RecordedEvent) -> Option<Protocol> {
-        match &event.event {
-            Some(recorded_event::Event::PgMessage(_)) => Some(Protocol::Postgres),
-            Some(recorded_event::Event::RedisCommand(_))
-            | Some(recorded_event::Event::RedisResponse(_)) => Some(Protocol::Redis),
-            Some(recorded_event::Event::HttpRequest(_))
-            | Some(recorded_event::Event::HttpResponse(_)) => Some(Protocol::Http),
-            Some(recorded_event::Event::GrpcRequest(_))
-            | Some(recorded_event::Event::GrpcResponse(_)) => Some(Protocol::Grpc),
-            _ => None,
-        }
-    }
-
-    fn serialize_event(&self, event: &RecordedEvent) -> Option<bytes::Bytes> {
-        match &event.event {
-            Some(recorded_event::Event::PgMessage(msg)) => {
-                if let Some(m) = &msg.message {
-                    crate::protocols::postgres::PgSerializer::serialize_message(m)
-                } else {
-                    None
-                }
-            }
-            Some(inner @ recorded_event::Event::RedisResponse(_)) => {
-                crate::protocols::redis::RedisSerializer::serialize_message(inner)
-            }
-            Some(inner @ recorded_event::Event::HttpResponse(_)) => {
-                crate::protocols::http::HttpSerializer::serialize_message(inner)
-            }
-            Some(inner @ recorded_event::Event::GrpcResponse(_)) => {
-                crate::protocols::grpc::GrpcSerializer::serialize_message(inner)
-            }
-            _ => None,
-        }
-    }
-
-    fn find_match_index(&mut self, incoming: &RecordedEvent) -> Option<usize> {
-        // Optimize: Advance search_start past already visited items
-        while self.search_start < self.recordings.len() && self.visited[self.search_start] {
-            self.search_start += 1;
-        }
-
-        use crate::hash::EventHasher;
-        let hash = EventHasher::calculate_hash(incoming);
-        if hash != 0 {
-            if let Some(recorded_event::Event::PgMessage(_)) = &incoming.event {
-                info!(
-                    "[ReplayEngine] Searching for Postgres match. Hash: {}",
-                    hash
-                );
-            }
-        }
-
-        if let Some(candidates) = self.lookup.get(&hash) {
-            // Candidates are indices in recordings.
-            // We need to find the *first* valid candidate (respecting order if multiple same reqs).
-            // However, just picking first unvisited might violate global order if strictly sequential?
-            // But we allow concurrency.
-            // Let's iterate candidates.
-            for &index in candidates {
-                if index < self.search_start {
-                    continue;
-                } // Too old
-                if self.visited[index] {
-                    continue;
-                } // Already used
-
-                let recorded = &self.recordings[index];
-
-                // Connection ID Mapping Logic
-                let inc_id = &incoming.connection_id;
-                let rec_id = &recorded.connection_id;
-
-                if !inc_id.is_empty() && !rec_id.is_empty() {
-                    if let Some(mapped_id) = self.connection_map.get(inc_id) {
-                        if mapped_id != rec_id {
-                            // Don't log for every candidate, only if we were specifically looking for this one?
-                            continue;
-                        }
-                    }
-                }
-
-                // If index is FAR ahead, warn? But window logic was for linear scan efficiency.
-                // With hash, we can jump.
-                // BUT, if we have {Req A, Req B} recorded, and we receive Req B, we shouldn't match B if A is expected strictly before?
-                // But in concurrent world, A and B might come in any order.
-                // So we trust the Hash.
-
-                // Do strict check
-                // Re-use logic for deep comparison (or trust hash?)
-                // Hash ignores headers/some args. We must verify strictly.
-                if self.is_strict_match(incoming, recorded) {
-                    // Success! Pin the connection IDs if not already pinned
-                    let inc_id = &incoming.connection_id;
-                    let rec_id = &recorded.connection_id;
-                    if !inc_id.is_empty() && !rec_id.is_empty() {
-                        self.connection_map.insert(inc_id.clone(), rec_id.clone());
-                    }
-                    return Some(index);
-                }
-            }
-        }
-
-        // Fallback or No Match
-        None
-    }
-
-    // Extracted helper for detailed comparison
-    fn is_strict_match(&self, incoming: &RecordedEvent, recorded: &RecordedEvent) -> bool {
+    /// Protocol-aware request matching using MatchConfig
+    fn match_request(&self, incoming: &RecordedEvent, recorded: &RecordedEvent) -> bool {
         match (&incoming.event, &recorded.event) {
             (
                 Some(recorded_event::Event::HttpRequest(inc_req)),
                 Some(recorded_event::Event::HttpRequest(rec_req)),
             ) => {
-                // Match Method and Path
                 if inc_req.method != rec_req.method || inc_req.path != rec_req.path {
-                    false
-                } else if inc_req.headers != rec_req.headers {
-                    // Strict header matching for now
-                    false
-                } else if inc_req.body != rec_req.body {
-                    // Strict body matching for now
-                    false
-                } else {
-                    true
+                    return false;
                 }
+                if self.match_config.http.compare_headers && inc_req.headers != rec_req.headers {
+                    return false;
+                }
+                if self.match_config.http.compare_body && inc_req.body != rec_req.body {
+                    return false;
+                }
+                true
             }
             (
                 Some(recorded_event::Event::RedisCommand(inc_cmd)),
                 Some(recorded_event::Event::RedisCommand(rec_cmd)),
             ) => {
-                // Match Command
-                if inc_cmd.command != rec_cmd.command {
-                    false
-                } else if inc_cmd.args.len() != rec_cmd.args.len() {
-                    false
-                } else {
-                    // Compare args deeply with fuzzy matching logic
-                    let mut args_match = true;
-                    for (i, inc_arg) in inc_cmd.args.iter().enumerate() {
-                        let rec_arg = &rec_cmd.args[i];
+                if inc_cmd.command.to_uppercase() != rec_cmd.command.to_uppercase() {
+                    return false;
+                }
+                if inc_cmd.args.len() != rec_cmd.args.len() {
+                    return false;
+                }
+                for (i, inc_arg) in inc_cmd.args.iter().enumerate() {
+                    let rec_arg = &rec_cmd.args[i];
 
-                        // Fuzzy matching for SET expiration
-                        if i > 0 && inc_cmd.command.to_uppercase() == "SET" {
-                            let prev_arg = &inc_cmd.args[i - 1];
-                            if let Some(crate::events::redis_value::Kind::BulkString(prev_bytes)) =
-                                &prev_arg.kind
-                            {
-                                if let Ok(prev_str) = std::str::from_utf8(prev_bytes) {
-                                    if prev_str.to_uppercase() == "EX"
-                                        || prev_str.to_uppercase() == "PX"
+                    // Fuzzy matching for SET expiration
+                    if i > 0 && inc_cmd.command.to_uppercase() == "SET" {
+                        let prev_arg = &inc_cmd.args[i - 1];
+                        if let Some(crate::events::redis_value::Kind::BulkString(prev_bytes)) =
+                            &prev_arg.kind
+                        {
+                            if let Ok(prev_str) = std::str::from_utf8(prev_bytes) {
+                                if prev_str.to_uppercase() == "EX"
+                                    || prev_str.to_uppercase() == "PX"
+                                {
+                                    if let (Some(inc_int), Some(rec_int)) =
+                                        (parse_redis_int(inc_arg), parse_redis_int(rec_arg))
                                     {
-                                        // This arg is likely a TTL
-                                        if let (Some(inc_int), Some(rec_int)) =
-                                            (parse_redis_int(inc_arg), parse_redis_int(rec_arg))
-                                        {
-                                            let diff = (inc_int - rec_int).abs();
-                                            let tolerance = if prev_str.to_uppercase() == "EX" {
-                                                1
-                                            } else {
-                                                100
-                                            };
-                                            if diff <= tolerance {
-                                                continue; // Match!
-                                            }
+                                        let diff = (inc_int - rec_int).unsigned_abs();
+                                        let tolerance = self.match_config.redis.ttl_tolerance_ms;
+                                        let tol = if prev_str.to_uppercase() == "EX" {
+                                            (tolerance / 1000).max(1)
+                                        } else {
+                                            tolerance
+                                        };
+                                        if diff <= tol {
+                                            continue;
                                         }
                                     }
                                 }
                             }
                         }
-
-                        // Default strict equality check
-                        if inc_arg != rec_arg {
-                            args_match = false;
-                            break;
-                        }
                     }
-                    args_match
+
+                    if inc_arg != rec_arg {
+                        return false;
+                    }
                 }
+                true
             }
             (
                 Some(recorded_event::Event::PgMessage(inc_msg)),
@@ -414,7 +398,10 @@ impl ReplayEngine {
                 (
                     Some(pg_message_event::Message::Query(inc_q)),
                     Some(pg_message_event::Message::Query(rec_q)),
-                ) => inc_q.query == rec_q.query,
+                ) => {
+                    !self.match_config.postgres.compare_query_text
+                        || inc_q.query == rec_q.query
+                }
                 (
                     Some(pg_message_event::Message::Startup(inc_s)),
                     Some(pg_message_event::Message::Startup(rec_s)),
@@ -422,15 +409,18 @@ impl ReplayEngine {
                 (
                     Some(pg_message_event::Message::Parse(inc_p)),
                     Some(pg_message_event::Message::Parse(rec_p)),
-                ) => inc_p.query == rec_p.query,
+                ) => {
+                    !self.match_config.postgres.compare_query_text
+                        || inc_p.query == rec_p.query
+                }
                 (
                     Some(pg_message_event::Message::Bind(_)),
                     Some(pg_message_event::Message::Bind(_)),
-                ) => true, // Relaxed matching for Bind
+                ) => true,
                 (
                     Some(pg_message_event::Message::Execute(_)),
                     Some(pg_message_event::Message::Execute(_)),
-                ) => true, // Relaxed matching for Execute
+                ) => true,
                 (
                     Some(pg_message_event::Message::Sync(_)),
                     Some(pg_message_event::Message::Sync(_)),
@@ -441,95 +431,223 @@ impl ReplayEngine {
                 Some(recorded_event::Event::GrpcRequest(inc_req)),
                 Some(recorded_event::Event::GrpcRequest(rec_req)),
             ) => {
-                // Match gRPC requests by service, method, and request body
                 if inc_req.service != rec_req.service {
                     return false;
                 }
                 if inc_req.method != rec_req.method {
                     return false;
                 }
-                // For strict matching, compare request bodies
-                if inc_req.request_body != rec_req.request_body {
+                if self.match_config.grpc.compare_request_body
+                    && inc_req.request_body != rec_req.request_body
+                {
                     return false;
                 }
                 true
             }
-
+            (
+                Some(recorded_event::Event::TcpData(inc_data)),
+                Some(recorded_event::Event::TcpData(rec_data)),
+            ) => inc_data.data == rec_data.data,
             _ => false,
         }
     }
 
-    // Look for the next available TimeCapture event
-    pub fn handle_time_request(&mut self) -> Option<u64> {
-        for (index, recorded) in self.recordings.iter().enumerate() {
-            if self.visited[index] {
+    /// Handle a runtime request with scope-based lookup.
+    ///
+    /// Looks up by (trace_id, scope_id, kind, seq) for deterministic multi-call replay.
+    pub fn handle_runtime_request_with_seq(
+        &mut self,
+        trace_id: &str,
+        task_id: Option<&str>,
+        kind: &str,
+        seq: u64,
+    ) -> Option<String> {
+        // Look for matching ND event by (trace_id, scope_id from task_id, kind, seq)
+        for recorded in &self.recordings {
+            // Match trace_id
+            if !trace_id.is_empty() && recorded.trace_id != trace_id {
+                continue;
+            }
+
+            // Check scope_id matches task scope if task_id provided
+            if let Some(tid) = task_id {
+                let expected_scope = ScopeId::task(trace_id, tid);
+                if recorded.scope_id != expected_scope.as_str() {
+                    continue;
+                }
+            }
+
+            // Check metadata for kind and seq
+            let event_kind = recorded.metadata.get("nd_kind");
+            let event_seq = recorded.metadata.get("nd_seq");
+
+            if let (Some(ek), Some(es)) = (event_kind, event_seq) {
+                if ek == kind {
+                    if let Ok(event_seq_num) = es.parse::<u64>() {
+                        if event_seq_num == seq {
+                            return self.extract_nd_value(recorded);
+                        }
+                    }
+                }
+            }
+
+            // Fallback: check scope_sequence directly if metadata is missing
+            if recorded.scope_sequence == seq {
+                if let Some(recorded_event::Event::NonDeterministic(nd_event)) = &recorded.event {
+                    if self.matches_nd_kind(nd_event, kind) {
+                        return self.extract_nd_value(recorded);
+                    }
+                }
+            }
+        }
+
+        warn!(
+            "[Replay] No recorded value found for trace={}, task={:?}, kind={}, seq={}",
+            trace_id, task_id, kind, seq
+        );
+        None
+    }
+
+    /// Legacy runtime request handler (no sequence).
+    ///
+    /// Tracks a per-(trace_id, kind) cursor so that sequential calls
+    /// return successive recorded values instead of always the first.
+    pub fn handle_runtime_request(&mut self, trace_id: &str, kind: &str) -> Option<String> {
+        let cursor_key = format!("{}:{}", trace_id, kind);
+        let start_idx = self.runtime_cursor.get(&cursor_key).copied().unwrap_or(0);
+
+        for (idx, recorded) in self.recordings.iter().enumerate().skip(start_idx) {
+            if !trace_id.is_empty() && recorded.trace_id != trace_id {
                 continue;
             }
 
             if let Some(recorded_event::Event::NonDeterministic(nd_event)) = &recorded.event {
-                if let Some(crate::events::non_deterministic_event::Kind::TimeCaptureNs(time_ns)) =
-                    &nd_event.kind
-                {
-                    self.visited[index] = true;
-                    return Some(*time_ns);
+                if let Some(k) = &nd_event.kind {
+                    let matched = match (kind, k) {
+                        (
+                            "uuid" | "uuid_v7",
+                            crate::events::non_deterministic_event::Kind::UuidCapture(val),
+                        ) => Some(val.clone()),
+                        (
+                            "time",
+                            crate::events::non_deterministic_event::Kind::TimeCaptureNs(val),
+                        ) => Some(val.to_string()),
+                        (
+                            "random",
+                            crate::events::non_deterministic_event::Kind::RandomSeedCapture(val),
+                        ) => Some(val.to_string()),
+                        (
+                            "task_spawn",
+                            crate::events::non_deterministic_event::Kind::TaskSpawnCapture(val),
+                        ) => Some(val.clone()),
+                        (
+                            "random_bytes",
+                            crate::events::non_deterministic_event::Kind::RandomBytesCapture(val),
+                        ) => Some(hex::encode(val)),
+                        (
+                            "nanoid",
+                            crate::events::non_deterministic_event::Kind::NanoidCapture(val),
+                        ) => Some(val.clone()),
+                        _ => None,
+                    };
+                    if let Some(value) = matched {
+                        self.runtime_cursor.insert(cursor_key, idx + 1);
+                        return Some(value);
+                    }
                 }
             }
         }
         None
     }
 
-    /// Look for the next available UUID capture event
-    pub fn handle_uuid_request(&mut self) -> Option<String> {
-        for (index, recorded) in self.recordings.iter().enumerate() {
-            if self.visited[index] {
-                continue;
+    fn matches_nd_kind(
+        &self,
+        nd_event: &crate::events::NonDeterministicEvent,
+        kind: &str,
+    ) -> bool {
+        if let Some(k) = &nd_event.kind {
+            match (kind, k) {
+                ("uuid" | "uuid_v7", crate::events::non_deterministic_event::Kind::UuidCapture(_)) => true,
+                ("time", crate::events::non_deterministic_event::Kind::TimeCaptureNs(_)) => true,
+                ("random", crate::events::non_deterministic_event::Kind::RandomSeedCapture(_)) => true,
+                ("task_spawn", crate::events::non_deterministic_event::Kind::TaskSpawnCapture(_)) => true,
+                ("random_bytes", crate::events::non_deterministic_event::Kind::RandomBytesCapture(_)) => true,
+                ("nanoid", crate::events::non_deterministic_event::Kind::NanoidCapture(_)) => true,
+                _ => false,
             }
+        } else {
+            false
+        }
+    }
 
-            if let Some(recorded_event::Event::NonDeterministic(nd_event)) = &recorded.event {
-                if let Some(crate::events::non_deterministic_event::Kind::UuidCapture(uuid_str)) =
-                    &nd_event.kind
-                {
-                    self.visited[index] = true;
-                    return Some(uuid_str.clone());
-                }
+    fn extract_nd_value(&self, recorded: &RecordedEvent) -> Option<String> {
+        if let Some(recorded_event::Event::NonDeterministic(nd_event)) = &recorded.event {
+            if let Some(k) = &nd_event.kind {
+                return match k {
+                    crate::events::non_deterministic_event::Kind::UuidCapture(val) => {
+                        Some(val.clone())
+                    }
+                    crate::events::non_deterministic_event::Kind::TimeCaptureNs(val) => {
+                        Some(val.to_string())
+                    }
+                    crate::events::non_deterministic_event::Kind::RandomSeedCapture(val) => {
+                        Some(val.to_string())
+                    }
+                    crate::events::non_deterministic_event::Kind::TaskSpawnCapture(val) => {
+                        Some(val.clone())
+                    }
+                    crate::events::non_deterministic_event::Kind::RandomBytesCapture(val) => {
+                        Some(hex::encode(val))
+                    }
+                    crate::events::non_deterministic_event::Kind::NanoidCapture(val) => {
+                        Some(val.clone())
+                    }
+                };
             }
         }
         None
     }
 
-    /// Look for the next available random seed capture event
+    /// Legacy handlers
     pub fn handle_random_request(&mut self) -> Option<u64> {
-        for (index, recorded) in self.recordings.iter().enumerate() {
-            if self.visited[index] {
-                continue;
-            }
-
-            if let Some(recorded_event::Event::NonDeterministic(nd_event)) = &recorded.event {
-                if let Some(crate::events::non_deterministic_event::Kind::RandomSeedCapture(seed)) =
-                    &nd_event.kind
-                {
-                    self.visited[index] = true;
-                    return Some(*seed);
-                }
-            }
-        }
-        None
+        self.handle_runtime_request("", "random")
+            .and_then(|s| s.parse().ok())
     }
 
-    /// Get count of remaining unvisited recordings
-    pub fn remaining_count(&self) -> usize {
-        self.visited.iter().filter(|&&v| !v).count()
+    pub fn handle_uuid_request(&mut self) -> Option<String> {
+        self.handle_runtime_request("", "uuid")
     }
 
-    /// Get total recordings count
+    pub fn handle_time_request(&mut self) -> Option<u64> {
+        self.handle_runtime_request("", "time")
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Get count of total recordings
     pub fn total_count(&self) -> usize {
         self.recordings.len()
+    }
+
+    /// Get count of remaining (approximate — counts non-ND events without matched scope sequences)
+    pub fn remaining_count(&self) -> usize {
+        // Approximate: total minus events that have been sequence-matched
+        self.recordings.len()
+    }
+
+    /// Reset sequence tracker for fresh replay
+    pub fn reset(&mut self) {
+        self.sequence_tracker.clear();
+        self.runtime_cursor.clear();
+    }
+
+    /// Reset sequences for a specific trace
+    pub fn reset_trace(&mut self, trace_id: &str) {
+        self.sequence_tracker.reset_trace(trace_id);
     }
 
     // ============ Orchestration Methods ============
 
     /// Get the trigger event (first HTTP or gRPC request) for a specific trace_id
-    /// Used in orchestrated replay to initiate the recorded flow
     pub fn get_trigger_event(&self, trace_id: &str) -> Option<&RecordedEvent> {
         self.recordings.iter().find(|event| {
             event.trace_id == trace_id
@@ -538,31 +656,20 @@ impl ReplayEngine {
         })
     }
 
-    /// Check if a trigger event is HTTP
     pub fn is_http_trigger(&self, event: &RecordedEvent) -> bool {
         matches!(&event.event, Some(recorded_event::Event::HttpRequest(_)))
     }
 
-    /// Check if a trigger event is gRPC
     pub fn is_grpc_trigger(&self, event: &RecordedEvent) -> bool {
         matches!(&event.event, Some(recorded_event::Event::GrpcRequest(_)))
     }
 
     /// Get all trace IDs in the recordings
     pub fn get_all_trace_ids(&self) -> Vec<String> {
-        let mut trace_ids: Vec<_> = self
-            .recordings
-            .iter()
-            .filter(|e| !e.trace_id.is_empty())
-            .map(|e| e.trace_id.clone())
-            .collect();
-        trace_ids.sort();
-        trace_ids.dedup();
-        trace_ids
+        self.index.trace_ids().cloned().collect()
     }
 
-    /// Get the expected response (HTTP or gRPC) for a trace_id
-    /// Used to compare with actual response in orchestrated replay
+    /// Get the expected response for a trace_id
     pub fn get_expected_response(&self, trace_id: &str) -> Option<&RecordedEvent> {
         self.recordings.iter().find(|event| {
             event.trace_id == trace_id
@@ -595,7 +702,6 @@ impl ReplayEngine {
     }
 
     /// Extract gRPC request info for orchestrated replay
-    /// Returns (service, method, request_body) tuple
     pub fn get_grpc_request_info(
         &self,
         event: &RecordedEvent,
@@ -611,7 +717,7 @@ impl ReplayEngine {
         }
     }
 
-    /// Compare two gRPC responses and return a diff result
+    /// Compare two gRPC responses
     pub fn compare_grpc_responses(
         &self,
         expected: &RecordedEvent,
@@ -629,7 +735,6 @@ impl ReplayEngine {
             }
         };
 
-        // Compare status codes
         let expected_status = expected_resp.status_code as u32;
         if actual_status != expected_status {
             return OrchestrationResult {
@@ -646,7 +751,6 @@ impl ReplayEngine {
             };
         }
 
-        // Compare response bodies
         if actual_body != expected_resp.response_body.as_slice() {
             return OrchestrationResult {
                 pass: false,
@@ -666,7 +770,7 @@ impl ReplayEngine {
         }
     }
 
-    /// Compare two HTTP responses and return a diff result
+    /// Compare two HTTP responses with body comparison
     pub fn compare_responses(
         &self,
         expected: &RecordedEvent,
@@ -683,7 +787,7 @@ impl ReplayEngine {
             }
         };
 
-        // Parse actual response (simple HTTP/1.1 parsing)
+        // Parse actual response
         let actual_str = String::from_utf8_lossy(actual_bytes);
         let mut lines = actual_str.lines();
 
@@ -700,7 +804,6 @@ impl ReplayEngine {
             })
             .unwrap_or(0);
 
-        // Check status code
         if actual_status != expected_resp.status {
             return OrchestrationResult {
                 pass: false,
@@ -716,20 +819,65 @@ impl ReplayEngine {
             };
         }
 
-        // For now, consider status match a pass
-        // TODO: Add header and body comparison
+        // Extract body (after empty line)
+        let mut body_started = false;
+        let mut actual_body = String::new();
+        for line in lines {
+            if body_started {
+                if !actual_body.is_empty() {
+                    actual_body.push('\n');
+                }
+                actual_body.push_str(line);
+            } else if line.is_empty() {
+                body_started = true;
+            }
+        }
+
+        // Compare body if expected has one
+        if !expected_resp.body.is_empty() {
+            let expected_body = String::from_utf8_lossy(&expected_resp.body);
+
+            // Try JSON structural equality for JSON content
+            if let (Ok(expected_json), Ok(actual_json)) = (
+                serde_json::from_str::<serde_json::Value>(&expected_body),
+                serde_json::from_str::<serde_json::Value>(&actual_body),
+            ) {
+                if expected_json != actual_json {
+                    return OrchestrationResult {
+                        pass: false,
+                        message: "HTTP response body mismatch (JSON)".to_string(),
+                        diff: Some(ResponseDiff {
+                            status_diff: None,
+                            header_diffs: vec![],
+                            body_diff: Some(format!(
+                                "Expected: {}\nActual: {}",
+                                expected_body, actual_body
+                            )),
+                        }),
+                    };
+                }
+            } else if expected_body != actual_body {
+                // Byte-level comparison for non-JSON
+                return OrchestrationResult {
+                    pass: false,
+                    message: "HTTP response body mismatch".to_string(),
+                    diff: Some(ResponseDiff {
+                        status_diff: None,
+                        header_diffs: vec![],
+                        body_diff: Some(format!(
+                            "Expected: {}\nActual: {}",
+                            expected_body, actual_body
+                        )),
+                    }),
+                };
+            }
+        }
+
         OrchestrationResult {
             pass: true,
             message: "Response matches".to_string(),
             diff: None,
         }
-    }
-
-    /// Reset all visited flags for a fresh replay
-    pub fn reset(&mut self) {
-        self.visited.fill(false);
-        self.search_start = 0;
-        self.connection_map.clear();
     }
 }
 
@@ -744,12 +892,12 @@ pub struct OrchestrationResult {
 /// Detailed diff between expected and actual responses
 #[derive(Debug, Clone)]
 pub struct ResponseDiff {
-    pub status_diff: Option<(u32, u32)>, // (expected, actual)
-    pub header_diffs: Vec<(String, Option<String>, Option<String>)>, // (key, expected, actual)
+    pub status_diff: Option<(u32, u32)>,
+    pub header_diffs: Vec<(String, Option<String>, Option<String>)>,
     pub body_diff: Option<String>,
 }
 
-// Helper to extract integer from RedisValue regardless of type (Integer or String representation)
+// Helper to extract integer from RedisValue
 fn parse_redis_int(val: &crate::events::RedisValue) -> Option<i64> {
     match &val.kind {
         Some(redis_value::Kind::Integer(i)) => Some(*i),
@@ -769,7 +917,6 @@ pub async fn load_recordings(
     info!("Reading recordings from path: {:?}", path);
 
     if path.is_file() {
-        // Direct file load
         if let Some(ext) = path.extension() {
             if ext == "bin" {
                 load_binary_file(&path, &mut recordings).await?;
@@ -780,8 +927,6 @@ pub async fn load_recordings(
             load_jsonl_file(&path, &mut recordings).await?;
         }
     } else {
-        // Directory logic
-        // Check if it's a session dir (contains event files directly) OR a root containing sessions
         let events_bin = path.join("events.bin");
         let events_json = path.join("events.jsonl");
 
@@ -790,7 +935,6 @@ pub async fn load_recordings(
         } else if events_json.exists() {
             load_jsonl_file(&events_json, &mut recordings).await?;
         } else {
-            // Assume it's a root directory with sessions
             let sessions_dir = path.join("sessions");
             let target_dir = if sessions_dir.exists() {
                 sessions_dir
@@ -810,12 +954,9 @@ pub async fn load_recordings(
                         } else if json.exists() {
                             load_jsonl_file(&json, &mut recordings).await?;
                         }
-                    } else {
-                        // Legacy flat files check
-                        if entry_path.extension().is_some_and(|ext| ext == "jsonl") {
-                            info!("Loading legacy flat file: {:?}", entry_path);
-                            load_jsonl_file(&entry_path, &mut recordings).await?;
-                        }
+                    } else if entry_path.extension().is_some_and(|ext| ext == "jsonl") {
+                        info!("Loading legacy flat file: {:?}", entry_path);
+                        load_jsonl_file(&entry_path, &mut recordings).await?;
                     }
                 }
             }

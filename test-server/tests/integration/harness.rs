@@ -55,78 +55,129 @@ impl TestHarness {
         sleep(Duration::from_millis(100)).await;
     }
 
-    /// Start the proxy in recording mode
-    /// Uses --map format: PROXY_PORT:TARGET_HOST:TARGET_PORT
-    pub async fn start_proxy_record(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Start the proxy in recording mode with custom mappings
+    /// map format: "LISTEN_PORT:TARGET_HOST:TARGET_PORT"
+    pub async fn start_proxy_record_with_maps(
+        &mut self,
+        maps: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let recordings_path = self.recordings_dir.path().to_str().unwrap();
 
-        // Format: PROXY_PORT:TARGET_HOST:TARGET_PORT
-        let map_arg = format!("{}:127.0.0.1:{}", self.proxy_port, self.mock_backend_port);
+        let mut args = Vec::new();
 
-        let child = Command::new("cargo")
-            .args([
-                "run",
-                "-p",
-                "deja-proxy",
-                "--",
-                "--map",
-                &map_arg,
-                "--mode",
-                "record",
-                "--record-dir",
-                recordings_path,
-                "--control-port",
-                &self.control_api_port.to_string(),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        for map in &maps {
+            args.push("--map".to_string());
+            args.push(map.clone());
+        }
 
-        self.proxy_process = Some(child);
+        args.extend_from_slice(&[
+            "--mode".to_string(),
+            "record".to_string(),
+            "--record-dir".to_string(),
+            recordings_path.to_string(),
+            "--control-port".to_string(),
+            self.control_api_port.to_string(),
+        ]);
 
-        // Wait for proxy to be ready (compile + start)
-        sleep(Duration::from_secs(3)).await;
+        let cwd = std::env::current_dir().unwrap();
+        let mut binary_path = cwd.join("target/debug/deja-proxy");
+        if !binary_path.exists() {
+            binary_path = cwd.join("../target/debug/deja-proxy");
+        }
 
-        // Verify proxy is listening
-        self.wait_for_proxy().await?;
-
-        Ok(())
-    }
-
-    /// Start the proxy in replay mode
-    pub async fn start_proxy_replay(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let recordings_path = self.recordings_dir.path().to_str().unwrap();
-
-        // In replay mode, target is ignored but we still need to provide the map
-        let map_arg = format!("{}:127.0.0.1:{}", self.proxy_port, self.mock_backend_port);
-
-        let child = Command::new("cargo")
-            .args([
-                "run",
-                "-p",
-                "deja-proxy",
-                "--",
-                "--map",
-                &map_arg,
-                "--mode",
-                "replay",
-                "--record-dir",
-                recordings_path,
-                "--control-port",
-                &self.control_api_port.to_string(),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        let child = Command::new(binary_path)
+            .args(&args)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()?;
 
         self.proxy_process = Some(child);
 
         // Wait for proxy to be ready
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(5)).await;
 
-        self.wait_for_proxy().await?;
+        // Wait for first port
+        if let Some(first_map) = maps.first() {
+            let parts: Vec<&str> = first_map.split(':').collect();
+            let port = parts[0];
+            self.wait_for_port(port.parse().unwrap()).await?;
+        }
 
         Ok(())
+    }
+
+    /// Start the proxy in replay mode with custom mappings
+    pub async fn start_proxy_replay_with_maps(
+        &mut self,
+        maps: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let recordings_path = self.recordings_dir.path().to_str().unwrap();
+
+        let mut args = Vec::new();
+
+        for map in &maps {
+            args.push("--map".to_string());
+            args.push(map.clone());
+        }
+
+        args.extend_from_slice(&[
+            "--mode".to_string(),
+            "replay".to_string(),
+            "--record-dir".to_string(),
+            recordings_path.to_string(),
+            "--control-port".to_string(),
+            self.control_api_port.to_string(),
+        ]);
+
+        let cwd = std::env::current_dir().unwrap();
+        let mut binary_path = cwd.join("target/debug/deja-proxy");
+        if !binary_path.exists() {
+            binary_path = cwd.join("../target/debug/deja-proxy");
+        }
+
+        let child = Command::new(binary_path)
+            .args(&args)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        self.proxy_process = Some(child);
+
+        // Wait for proxy to be ready
+        sleep(Duration::from_secs(5)).await;
+
+        // Wait for first port
+        if let Some(first_map) = maps.first() {
+            let parts: Vec<&str> = first_map.split(':').collect();
+            let port = parts[0];
+            self.wait_for_port(port.parse().unwrap()).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Wait for a specific port to be open
+    async fn wait_for_port(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..20 {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+        Err(format!("Port {} did not open in time", port).into())
+    }
+
+    /// Start the proxy in recording mode
+    /// Uses --map format: PROXY_PORT:TARGET_HOST:TARGET_PORT
+    pub async fn start_proxy_record(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let map = format!("{}:127.0.0.1:{}", self.proxy_port, self.mock_backend_port);
+        self.start_proxy_record_with_maps(vec![map]).await
+    }
+
+    /// Start the proxy in replay mode
+    pub async fn start_proxy_replay(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let map = format!("{}:127.0.0.1:{}", self.proxy_port, self.mock_backend_port);
+        self.start_proxy_replay_with_maps(vec![map]).await
     }
 
     /// Wait for proxy to be ready by checking if the port is open

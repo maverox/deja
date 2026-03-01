@@ -45,8 +45,8 @@ impl ProtocolParser for RedisParser {
 pub struct RedisConnectionParser {
     client_buf: BytesMut,
     server_buf: BytesMut,
-    sequence: u64,
     connection_id: String,
+    is_replay: bool,
 }
 
 impl RedisConnectionParser {
@@ -54,8 +54,8 @@ impl RedisConnectionParser {
         Self {
             client_buf: BytesMut::new(),
             server_buf: BytesMut::new(),
-            sequence: 0,
             connection_id,
+            is_replay: false,
         }
     }
 
@@ -84,10 +84,12 @@ impl ConnectionParser for RedisConnectionParser {
     fn parse_client_data(&mut self, data: &[u8]) -> Result<ParseResult, ParseError> {
         self.client_buf.extend_from_slice(data);
 
+        // Tracks if we generated a reply for *all* commands in this batch
+        // Simplify: If we synthesize ANY reply, we return it.
+        // Realistically, PING is usually sent alone.
         let mut events = Vec::new();
-        // decode_bytes_mut modifies the buffer in place (advancing read pointer conceptually? or we need to slice?)
-        // redis-protocol 6.0 `decode_bytes_mut` takes &mut BytesMut and returns Ok(Some((frame, len))) ?
-        // Let's rely on the example pattern: it returns the frame and the amount of bytes consumed.
+        let mut reply = None;
+        let mut synthesized = false;
 
         loop {
             // We'll use a loop to decode as many frames as possible
@@ -98,14 +100,6 @@ impl ConnectionParser for RedisConnectionParser {
             match decode_bytes_mut(&mut self.client_buf) {
                 Ok(Some((frame, _amt, _buf))) => {
                     // Frame decoded successfully
-                    // Note: decode_bytes_mut in some versions REMOVES the bytes from the buffer.
-                    // In others it might not. The example shows `amt` being returned.
-                    // If it modifies client_buf, we don't need to split.
-                    // Let's assume standard behavior: it consumes valid bytes from the start.
-                    // Wait, if I'm not sure, I should check behavior.
-                    // But assuming it consumes based on typical `tokio_util::codec` patterns.
-                    // Actually, the example showed: `decode_bytes_mut(&mut bytes)`.
-
                     // Convert frame to event
                     let val = Self::frame_to_redis_value(frame);
 
@@ -120,35 +114,79 @@ impl ConnectionParser for RedisConnectionParser {
                                 "UNKNOWN".to_string()
                             };
 
-                            let args = arr.values.into_iter().skip(1).collect();
+                            // Check for PING in Replay Mode
+                            if self.is_replay && cmd_name.eq_ignore_ascii_case("PING") {
+                                // Synthesize PONG
+                                let mut buf = BytesMut::new();
+                                if arr.values.len() > 1 {
+                                    // PING with message: return Bulk String
+                                    if let Some(Some(redis_value::Kind::BulkString(arg))) =
+                                        arr.values.get(1).map(|v| &v.kind)
+                                    {
+                                        RedisSerializer::encode_value(
+                                            &mut buf,
+                                            &RedisValue {
+                                                kind: Some(redis_value::Kind::BulkString(
+                                                    arg.clone(),
+                                                )),
+                                            },
+                                        );
+                                    } else {
+                                        // Fallback
+                                        RedisSerializer::encode_value(
+                                            &mut buf,
+                                            &RedisValue {
+                                                kind: Some(redis_value::Kind::SimpleString(
+                                                    "PONG".to_string(),
+                                                )),
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    RedisSerializer::encode_value(
+                                        &mut buf,
+                                        &RedisValue {
+                                            kind: Some(redis_value::Kind::SimpleString(
+                                                "PONG".to_string(),
+                                            )),
+                                        },
+                                    );
+                                }
+
+                                // Append to existing reply buffer if multiple commands?
+                                // ParseResult supports only one reply Option<Bytes>.
+                                // We should append.
+                                let mut current_reply =
+                                    reply.take().unwrap_or_else(|| BytesMut::new());
+                                current_reply.extend_from_slice(&buf);
+                                reply = Some(current_reply);
+                                synthesized = true;
+                            }
+
+                            let args: Vec<RedisValue> = arr.values.into_iter().skip(1).collect();
+
                             let event = RecordedEvent {
-                                trace_id: uuid::Uuid::new_v4().to_string(), // TODO correlation
-                                span_id: uuid::Uuid::new_v4().to_string(),
-                                sequence: self.sequence,
+                                trace_id: String::new(),
+                                scope_id: String::new(),
+                                scope_sequence: 0,
+                                global_sequence: 0,
                                 timestamp_ns: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_nanos()
                                     as u64,
-                                connection_id: self.connection_id.clone(),
+                                direction: 0,
                                 event: Some(recorded_event::Event::RedisCommand(
                                     RedisCommandEvent {
                                         command: cmd_name,
                                         args,
                                     },
                                 )),
-                                ..Default::default()
+                                metadata: Default::default(),
                             };
                             events.push(event);
-                            self.sequence += 1;
                         }
                     }
-
-                    // Since decode_bytes_mut removes the bytes, we don't need to manually advance total_consumed
-                    // relative to the original buffer if we passed `&mut self.client_buf`.
-                    // BUT, `decode_bytes_mut` might not remove them?
-                    // NOTE: In redis-protocol 6.0, `decode_bytes_mut` DOES advance the buffer.
-                    // So we are good.
                 }
                 Ok(None) => {
                     // Incomplete frame
@@ -161,17 +199,22 @@ impl ConnectionParser for RedisConnectionParser {
             }
         }
 
+        let forward = if synthesized {
+            Bytes::new()
+        } else {
+            Bytes::copy_from_slice(data)
+        };
+
         Ok(ParseResult {
             events,
-            forward: Bytes::copy_from_slice(data),
+            forward,
             needs_more: false, // We always forward anyway
-            reply: None,
+            reply: reply.map(|b| b.freeze()),
         })
     }
 
     fn parse_server_data(&mut self, data: &[u8]) -> Result<ParseResult, ParseError> {
         self.server_buf.extend_from_slice(data);
-
         let mut events = Vec::new();
 
         loop {
@@ -184,21 +227,21 @@ impl ConnectionParser for RedisConnectionParser {
                     let val = Self::frame_to_redis_value(frame);
 
                     let event = RecordedEvent {
-                        trace_id: uuid::Uuid::new_v4().to_string(),
-                        span_id: uuid::Uuid::new_v4().to_string(),
-                        sequence: self.sequence,
+                        trace_id: String::new(),
+                        scope_id: String::new(),
+                        scope_sequence: 0,
+                        global_sequence: 0,
                         timestamp_ns: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_nanos() as u64,
-                        connection_id: self.connection_id.clone(),
+                        direction: 0,
                         event: Some(recorded_event::Event::RedisResponse(RedisResponseEvent {
                             value: Some(val),
                         })),
-                        ..Default::default()
+                        metadata: Default::default(),
                     };
                     events.push(event);
-                    self.sequence += 1;
                 }
                 Ok(None) => break,
                 Err(e) => return Err(ParseError::Protocol(format!("Redis decode error: {:?}", e))),
@@ -222,7 +265,9 @@ impl ConnectionParser for RedisConnectionParser {
         self.server_buf.clear();
     }
 
-    fn set_mode(&mut self, _is_replay: bool) {}
+    fn set_mode(&mut self, is_replay: bool) {
+        self.is_replay = is_replay;
+    }
 }
 
 #[derive(Debug)]
@@ -318,4 +363,30 @@ impl RedisSerializer {
             }
         }
     }
+}
+
+/// Extract a Deja trace ID from a Redis CLIENT SETNAME command.
+///
+/// Matches: CLIENT SETNAME deja:<trace_id>
+/// Returns the trace_id portion if found, None otherwise.
+pub fn extract_redis_trace_id(cmd: &str, args: &[RedisValue]) -> Option<String> {
+    if !cmd.eq_ignore_ascii_case("CLIENT") {
+        return None;
+    }
+    let subcommand = args.first()?;
+    let subcommand_str = match &subcommand.kind {
+        Some(redis_value::Kind::BulkString(b)) => String::from_utf8_lossy(b).to_string(),
+        Some(redis_value::Kind::SimpleString(s)) => s.clone(),
+        _ => return None,
+    };
+    if !subcommand_str.eq_ignore_ascii_case("SETNAME") {
+        return None;
+    }
+    let name_val = args.get(1)?;
+    let name = match &name_val.kind {
+        Some(redis_value::Kind::BulkString(b)) => String::from_utf8_lossy(b).to_string(),
+        Some(redis_value::Kind::SimpleString(s)) => s.clone(),
+        _ => return None,
+    };
+    name.strip_prefix("deja:").map(|id| id.to_string())
 }

@@ -7,5 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_descriptor_set_path(out_dir.join("test_service_descriptor.bin"))
         .compile_protos(&["proto/test_service.proto"], &["proto/"])?;
 
+    tonic_build::configure().compile_protos(&["proto/connector.proto"], &["proto/"])?;
+
     Ok(())
 }

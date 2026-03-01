@@ -3,12 +3,9 @@ members = [
     "common",
     "core",
     "cli",
-    # "proto" # we will access proto as a library or build script inside core
-    # "agent",
     "proxy",
     "sdk",
     "test-server",
-    "test-service",
 ]
 resolver = "2"
 

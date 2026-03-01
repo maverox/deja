@@ -184,10 +184,58 @@ mod tests {
         };
 
         let bytes = GrpcSerializer::serialize_response(&response);
-        // Should have 5-byte header + payload
-        assert_eq!(bytes.len(), 5 + 12);
-        assert_eq!(bytes[0], 0); // not compressed
-        assert_eq!(&bytes[5..], b"test payload");
+
+        // The serializer now produces full HTTP/2 frames:
+        // 1. HEADERS frame (initial headers)
+        // 2. DATA frame (gRPC message with 5-byte length-prefix)
+        // 3. HEADERS frame (trailers with grpc-status)
+        //
+        // Verify structure rather than exact byte count since HPACK encoding varies
+
+        // At minimum, should have: 9-byte frame header + headers + 9-byte frame header + 5+12 data + 9-byte frame header + trailers
+        assert!(
+            bytes.len() > 50,
+            "Expected HTTP/2 frames with headers, data, and trailers. Got {} bytes",
+            bytes.len()
+        );
+
+        // Find the DATA frame (type 0x00) and verify it contains our payload
+        // HTTP/2 frame header: 3 bytes length + 1 byte type + 1 byte flags + 4 bytes stream ID
+        let mut pos = 0;
+        let mut found_data = false;
+        while pos + 9 <= bytes.len() {
+            let len = ((bytes[pos] as usize) << 16)
+                | ((bytes[pos + 1] as usize) << 8)
+                | (bytes[pos + 2] as usize);
+            let frame_type = bytes[pos + 3];
+
+            if frame_type == 0x00 {
+                // DATA frame
+                // Should contain gRPC framing (1 byte compressed + 4 bytes length) + payload
+                let data_start = pos + 9;
+                if data_start + len <= bytes.len() {
+                    assert_eq!(bytes[data_start], 0, "gRPC compressed flag should be 0");
+                    // Length should be 12 (payload size)
+                    let grpc_len = u32::from_be_bytes([
+                        bytes[data_start + 1],
+                        bytes[data_start + 2],
+                        bytes[data_start + 3],
+                        bytes[data_start + 4],
+                    ]);
+                    assert_eq!(grpc_len, 12, "gRPC payload length should be 12");
+                    // Payload should match
+                    assert_eq!(
+                        &bytes[data_start + 5..data_start + 5 + 12],
+                        b"test payload",
+                        "Payload mismatch"
+                    );
+                    found_data = true;
+                }
+            }
+
+            pos += 9 + len;
+        }
+        assert!(found_data, "DATA frame with payload not found");
     }
 
     #[test]

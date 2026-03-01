@@ -1,4 +1,3 @@
-
 //! gRPC protocol parser for Deja proxy
 //!
 //! gRPC uses HTTP/2 as transport with Protocol Buffers for serialization.
@@ -178,7 +177,6 @@ pub struct GrpcConnectionParser {
     connection_id: String,
     client_buf: BytesMut,
     server_buf: BytesMut,
-    sequence: u64,
     /// Stream states indexed by HTTP/2 stream ID
     streams: HashMap<u32, StreamState>,
     /// Whether we've seen the HTTP/2 preface
@@ -200,7 +198,6 @@ impl GrpcConnectionParser {
             connection_id,
             client_buf: BytesMut::new(),
             server_buf: BytesMut::new(),
-            sequence: 0,
             streams: HashMap::new(),
             preface_seen: false,
             pending_events: Vec::new(),
@@ -330,12 +327,14 @@ impl GrpcConnectionParser {
             }
         }
 
-        // Extract trace ID from headers for correlation (check both x-trace-id and x-request-id)
+        // Extract trace ID from headers — priority: traceparent > x-trace-id > x-request-id > x-b3-traceid
         if state.trace_id.is_none() {
             state.trace_id = state
                 .request_metadata
-                .get("x-trace-id")
+                .get("traceparent")
+                .or_else(|| state.request_metadata.get("x-trace-id"))
                 .or_else(|| state.request_metadata.get("x-request-id"))
+                .or_else(|| state.request_metadata.get("x-b3-traceid"))
                 .cloned();
         }
 
@@ -496,10 +495,11 @@ impl GrpcConnectionParser {
 
         let event = RecordedEvent {
             trace_id,
-            span_id: uuid::Uuid::new_v4().to_string(),
-            sequence: self.sequence,
+            scope_id: String::new(),
+            scope_sequence: 0,
+            global_sequence: 0,
             timestamp_ns: start_time_ns,
-            connection_id: self.connection_id.clone(),
+            direction: 0,
             event: Some(recorded_event::Event::GrpcRequest(GrpcRequestEvent {
                 service,
                 method,
@@ -509,10 +509,9 @@ impl GrpcConnectionParser {
                 stream_id,
                 authority,
             })),
-            ..Default::default()
+            metadata: Default::default(),
         };
 
-        self.sequence += 1;
         self.pending_events.push(event);
     }
 
@@ -555,10 +554,11 @@ impl GrpcConnectionParser {
 
         let event = RecordedEvent {
             trace_id,
-            span_id: uuid::Uuid::new_v4().to_string(),
-            sequence: self.sequence,
+            scope_id: String::new(),
+            scope_sequence: 0,
+            global_sequence: 0,
             timestamp_ns: now_ns,
-            connection_id: self.connection_id.clone(),
+            direction: 0,
             event: Some(recorded_event::Event::GrpcResponse(GrpcResponseEvent {
                 response_body,
                 status_code,
@@ -568,10 +568,9 @@ impl GrpcConnectionParser {
                 latency_ms,
                 stream_id,
             })),
-            ..Default::default()
+            metadata: Default::default(),
         };
 
-        self.sequence += 1;
         self.pending_events.push(event);
     }
 }

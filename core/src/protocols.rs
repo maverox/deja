@@ -8,6 +8,7 @@ pub mod grpc;
 pub mod http;
 pub mod postgres;
 pub mod redis;
+pub mod tcp;
 
 #[derive(Error, Debug)]
 pub enum ParseError {

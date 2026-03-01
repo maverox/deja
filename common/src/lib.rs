@@ -6,11 +6,17 @@
 //! - deja-sdk (client-side instrumentation)
 
 pub mod control;
+pub mod correlation_key;
+pub mod mode;
 mod protocol;
 pub mod runtime;
-mod sequence;
+pub mod scope;
+pub mod storage;
 
 pub use control::{ControlClient, ControlError, ControlMessage};
+pub use correlation_key::ConnectionKey;
+pub use mode::DejaMode;
 pub use protocol::Protocol;
-pub use runtime::DejaRuntime;
-pub use sequence::{SequenceKey, SequenceTracker};
+pub use runtime::{deja_run, deja_run_sync, DejaRuntime, SyncDejaRuntime};
+pub use scope::{OrderingSemantic, ScopeId, ScopeSequenceTracker};
+pub use storage::{IndexStore, RecordingStore, StorageConfig, StorageError};

@@ -30,7 +30,6 @@ impl ProtocolParser for HttpParser {
 pub struct HttpConnectionParser {
     client_buf: BytesMut,
     server_buf: BytesMut,
-    sequence: u64,
     connection_id: String,
 }
 
@@ -39,7 +38,6 @@ impl HttpConnectionParser {
         Self {
             client_buf: BytesMut::new(),
             server_buf: BytesMut::new(),
-            sequence: 0,
             connection_id,
         }
     }
@@ -105,14 +103,15 @@ impl ConnectionParser for HttpConnectionParser {
 
                 // Construct Protobuf Event
                 let event = RecordedEvent {
-                    trace_id: uuid::Uuid::new_v4().to_string(), // In reality, this should be correlated
-                    span_id: uuid::Uuid::new_v4().to_string(),
-                    sequence: self.sequence,
+                    trace_id: String::new(),
+                    scope_id: String::new(),
+                    scope_sequence: 0,
+                    global_sequence: 0,
                     timestamp_ns: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos() as u64,
-                    connection_id: self.connection_id.clone(),
+                    direction: 0,
                     event: Some(recorded_event::Event::HttpRequest(HttpRequestEvent {
                         method,
                         path,
@@ -121,9 +120,8 @@ impl ConnectionParser for HttpConnectionParser {
                         schema: "http".to_string(),
                         host, // Extracted from headers
                     })),
-                    ..Default::default()
+                    metadata: Default::default(),
                 };
-                self.sequence += 1;
 
                 Ok(ParseResult {
                     events: vec![event],
@@ -173,23 +171,23 @@ impl ConnectionParser for HttpConnectionParser {
                 use crate::events::HttpResponseEvent;
 
                 let event = RecordedEvent {
-                    trace_id: uuid::Uuid::new_v4().to_string(),
-                    span_id: uuid::Uuid::new_v4().to_string(),
-                    sequence: self.sequence,
+                    trace_id: String::new(),
+                    scope_id: String::new(),
+                    scope_sequence: 0,
+                    global_sequence: 0,
                     timestamp_ns: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos() as u64,
-                    connection_id: self.connection_id.clone(),
+                    direction: 0,
                     event: Some(recorded_event::Event::HttpResponse(HttpResponseEvent {
                         status: status_code,
                         headers: header_map,
                         body,
                         latency_ms: 0,
                     })),
-                    ..Default::default()
+                    metadata: Default::default(),
                 };
-                self.sequence += 1;
 
                 Ok(ParseResult {
                     events: vec![event],

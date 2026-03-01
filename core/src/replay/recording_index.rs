@@ -1,13 +1,7 @@
-//! Recording Index for Protocol-Scoped Replay
+//! Scope-Tree Recording Index
 //!
-//! This module provides efficient lookup of recorded messages by
-//! (trace_id, protocol, sequence) for deterministic replay.
-//!
-//! # Why Protocol-Scoped?
-//!
-//! Connection IDs are ephemeral - they change between recording and replay.
-//! By organizing recordings by (trace_id, protocol) pairs and using sequence
-//! numbers, we get stable identifiers that work across runs.
+//! Indexes recorded events by (trace_id, scope_id, scope_sequence) for deterministic replay.
+//! Uses the EventDirection field to classify request vs response events.
 //!
 //! # Structure
 //!
@@ -15,204 +9,209 @@
 //! RecordingIndex
 //! └── traces: HashMap<trace_id, RecordedTrace>
 //!     └── RecordedTrace
-//!         ├── postgres_messages: Vec<MessageExchange>
-//!         ├── redis_messages: Vec<MessageExchange>
-//!         ├── http_messages: Vec<MessageExchange>
-//!         └── grpc_messages: Vec<MessageExchange>
+//!         └── scopes: HashMap<ScopeId, Vec<MessageExchange>>
 //!             └── MessageExchange
-//!                 ├── sequence: u64
+//!                 ├── scope_sequence: u64
 //!                 ├── client_message: RecordedEvent
-//!                 └── server_responses: Vec<bytes::Bytes>
+//!                 ├── response_events: Vec<RecordedEvent>
+//!                 └── server_responses: Vec<Bytes>
 //! ```
 
-use crate::events::{recorded_event, RecordedEvent};
+use crate::events::{recorded_event, EventDirection, RecordedEvent};
 use bytes::Bytes;
-use deja_common::Protocol;
+use deja_common::{Protocol, ScopeId};
 use std::collections::HashMap;
 
 /// A recorded message exchange: client request + server responses
 #[derive(Debug, Clone)]
 pub struct MessageExchange {
-    /// Sequence number within (trace, protocol) scope
-    pub sequence: u64,
+    /// Position within this scope
+    pub scope_sequence: u64,
     /// The recorded client message (request)
     pub client_message: RecordedEvent,
     /// The original response events
     pub response_events: Vec<RecordedEvent>,
-    /// The server's response(s) as serialized bytes (optimized for non-complex protocols)
+    /// The server's response(s) as serialized bytes
     pub server_responses: Vec<Bytes>,
 }
 
-/// Messages grouped by protocol for a single trace
+/// All recorded data within a single scope
+#[derive(Debug, Clone, Default)]
+pub struct ScopeRecording {
+    pub scope_id: ScopeId,
+    pub protocol: Protocol,
+    pub exchanges: Vec<MessageExchange>,
+}
+
+/// A recorded trace with all its scopes
 #[derive(Debug, Default)]
 pub struct RecordedTrace {
-    /// PostgreSQL messages in sequence order
-    pub postgres_messages: Vec<MessageExchange>,
-    /// Redis messages in sequence order
-    pub redis_messages: Vec<MessageExchange>,
-    /// HTTP messages in sequence order
-    pub http_messages: Vec<MessageExchange>,
-    /// gRPC messages in sequence order
-    pub grpc_messages: Vec<MessageExchange>,
+    pub trace_id: String,
+    /// scope_id → ordered exchanges within that scope
+    pub scopes: HashMap<ScopeId, ScopeRecording>,
 }
 
-impl RecordedTrace {
-    /// Get messages for a specific protocol
-    pub fn get_messages(&self, protocol: Protocol) -> &[MessageExchange] {
-        match protocol {
-            Protocol::Postgres => &self.postgres_messages,
-            Protocol::Redis => &self.redis_messages,
-            Protocol::Http => &self.http_messages,
-            Protocol::Grpc => &self.grpc_messages,
-            Protocol::Unknown => &[],
-        }
-    }
-
-    /// Get mutable messages for a specific protocol
-    fn get_messages_mut(&mut self, protocol: Protocol) -> &mut Vec<MessageExchange> {
-        match protocol {
-            Protocol::Postgres => &mut self.postgres_messages,
-            Protocol::Redis => &mut self.redis_messages,
-            Protocol::Http => &mut self.http_messages,
-            Protocol::Grpc => &mut self.grpc_messages,
-            Protocol::Unknown => &mut self.postgres_messages, // Fallback, won't be used
-        }
-    }
-
-    /// Get a message by sequence number
-    pub fn get_by_sequence(&self, protocol: Protocol, sequence: u64) -> Option<&MessageExchange> {
-        self.get_messages(protocol).get(sequence as usize)
-    }
-
-    /// Count messages for a protocol
-    pub fn message_count(&self, protocol: Protocol) -> usize {
-        self.get_messages(protocol).len()
-    }
-}
-
-/// Index recordings by (trace_id, protocol, sequence) for efficient replay lookup
+/// Index recordings by (trace_id, scope_id, scope_sequence) for efficient replay lookup
 #[derive(Debug, Default)]
 pub struct RecordingIndex {
-    /// trace_id -> RecordedTrace
     traces: HashMap<String, RecordedTrace>,
 }
 
 impl RecordingIndex {
-    /// Create a new empty recording index
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Build index from a flat list of recorded events
+    /// Build index from a flat list of recorded events.
     ///
-    /// This groups events by (trace_id, protocol) and assigns sequence numbers
-    /// based on the order they appear in the recording.
+    /// Groups by (trace_id, scope_id), sorts by scope_sequence,
+    /// pairs client events with subsequent server events using the direction field.
     pub fn from_recordings(recordings: &[RecordedEvent]) -> Self {
         let mut index = Self::new();
 
-        // Group events by (trace_id, connection_id) first, then by protocol
-        // We need to track which events are requests vs responses
-        let mut current_request: Option<(String, Protocol, RecordedEvent)> = None;
-        let mut pending_response_bytes: Vec<Bytes> = Vec::new();
-        let mut pending_response_events: Vec<RecordedEvent> = Vec::new();
-        let mut sequence_counters: HashMap<(String, Protocol), u64> = HashMap::new();
+        // Group events by (trace_id, scope_id)
+        let mut grouped: HashMap<(String, String), Vec<RecordedEvent>> = HashMap::new();
 
         for event in recordings {
-            let trace_id = &event.trace_id;
-            if trace_id.is_empty() {
+            if event.trace_id.is_empty() {
                 continue;
             }
-
-            let protocol = Self::detect_event_protocol(event);
-            if matches!(protocol, Protocol::Unknown) {
-                continue;
-            }
-
-            let is_request = Self::is_client_request(event);
-
-            if is_request {
-                // Flush any pending request/responses
-                if let Some((req_trace, req_proto, req_event)) = current_request.take() {
-                    let seq_key = (req_trace.clone(), req_proto);
-                    let seq = *sequence_counters.get(&seq_key).unwrap_or(&0);
-                    sequence_counters.insert(seq_key, seq + 1);
-
-                    let exchange = MessageExchange {
-                        sequence: seq,
-                        client_message: req_event,
-                        response_events: std::mem::take(&mut pending_response_events),
-                        server_responses: std::mem::take(&mut pending_response_bytes),
-                    };
-
-                    index.add_exchange(&req_trace, req_proto, exchange);
-                }
-
-                // Start new request
-                current_request = Some((trace_id.clone(), protocol, event.clone()));
-                pending_response_bytes.clear();
-                pending_response_events.clear();
-            } else {
-                // This is a response, serialize and add to pending
-                pending_response_events.push(event.clone());
-                if let Some(bytes) = Self::serialize_response(event) {
-                    pending_response_bytes.push(bytes);
-                }
-            }
+            let key = (event.trace_id.clone(), event.scope_id.clone());
+            grouped.entry(key).or_default().push(event.clone());
         }
 
-        // Flush final request
-        if let Some((req_trace, req_proto, req_event)) = current_request {
-            let seq_key = (req_trace.clone(), req_proto);
-            let seq = *sequence_counters.get(&seq_key).unwrap_or(&0);
+        // Process each group
+        for ((trace_id, scope_id_str), mut events) in grouped {
+            // Sort by scope_sequence
+            events.sort_by_key(|e| e.scope_sequence);
 
-            let exchange = MessageExchange {
-                sequence: seq,
-                client_message: req_event,
-                response_events: pending_response_events,
-                server_responses: pending_response_bytes,
+            let scope_id = ScopeId::from_raw(&scope_id_str);
+            let protocol = Self::detect_scope_protocol(&events);
+
+            let mut exchanges = Vec::new();
+            let mut i = 0;
+
+            while i < events.len() {
+                let event = &events[i];
+
+                // Use direction field to classify
+                if Self::is_client_event(event) {
+                    let client_message = event.clone();
+                    let scope_seq = event.scope_sequence;
+
+                    // Collect subsequent server responses in same scope
+                    let mut response_events = Vec::new();
+                    let mut response_bytes = Vec::new();
+                    let mut j = i + 1;
+
+                    while j < events.len() {
+                        let next = &events[j];
+                        if Self::is_client_event(next) {
+                            break; // Next client request
+                        }
+                        response_events.push(next.clone());
+                        if let Some(bytes) = Self::serialize_response(next) {
+                            response_bytes.push(bytes);
+                        }
+                        j += 1;
+                    }
+
+                    exchanges.push(MessageExchange {
+                        scope_sequence: scope_seq,
+                        client_message,
+                        response_events,
+                        server_responses: response_bytes,
+                    });
+
+                    i = j;
+                } else {
+                    // Orphan response — skip
+                    i += 1;
+                }
+            }
+
+            let scope_recording = ScopeRecording {
+                scope_id: scope_id.clone(),
+                protocol,
+                exchanges,
             };
 
-            index.add_exchange(&req_trace, req_proto, exchange);
+            let trace = index
+                .traces
+                .entry(trace_id.clone())
+                .or_insert_with(|| RecordedTrace {
+                    trace_id: trace_id.clone(),
+                    scopes: HashMap::new(),
+                });
+            trace.scopes.insert(scope_id, scope_recording);
         }
 
         index
     }
 
-    /// Add a message exchange to the index
-    fn add_exchange(&mut self, trace_id: &str, protocol: Protocol, exchange: MessageExchange) {
-        let trace = self.traces.entry(trace_id.to_string()).or_default();
-        trace.get_messages_mut(protocol).push(exchange);
+    /// Get a specific exchange by (trace_id, scope_id, scope_sequence)
+    pub fn get_exchange(
+        &self,
+        trace_id: &str,
+        scope_id: &ScopeId,
+        scope_seq: u64,
+    ) -> Option<&MessageExchange> {
+        let trace = self.traces.get(trace_id)?;
+        let scope = trace.scopes.get(scope_id)?;
+        scope
+            .exchanges
+            .iter()
+            .find(|ex| ex.scope_sequence == scope_seq)
     }
 
-    /// Get a specific message exchange by (trace, protocol, sequence)
+    /// Legacy compatibility: get by (trace_id, protocol, sequence)
+    /// Searches all scopes of matching protocol
     pub fn get(
         &self,
         trace_id: &str,
         protocol: Protocol,
         sequence: u64,
     ) -> Option<&MessageExchange> {
-        self.traces
-            .get(trace_id)?
-            .get_by_sequence(protocol, sequence)
+        let trace = self.traces.get(trace_id)?;
+        let mut seq_counter = 0u64;
+        for scope in trace.scopes.values() {
+            if scope.protocol == protocol {
+                for ex in &scope.exchanges {
+                    if seq_counter == sequence {
+                        return Some(ex);
+                    }
+                    seq_counter += 1;
+                }
+            }
+        }
+        None
     }
 
-    /// Get all trace IDs in the index
     pub fn trace_ids(&self) -> impl Iterator<Item = &String> {
         self.traces.keys()
     }
 
-    /// Get a trace by ID
     pub fn get_trace(&self, trace_id: &str) -> Option<&RecordedTrace> {
         self.traces.get(trace_id)
     }
 
-    /// Get total number of traces
     pub fn trace_count(&self) -> usize {
         self.traces.len()
     }
 
+    /// Detect protocol from a set of events in a scope
+    fn detect_scope_protocol(events: &[RecordedEvent]) -> Protocol {
+        for event in events {
+            let proto = Self::detect_event_protocol(event);
+            if proto != Protocol::Unknown {
+                return proto;
+            }
+        }
+        Protocol::Unknown
+    }
+
     /// Detect the protocol of an event
-    fn detect_event_protocol(event: &RecordedEvent) -> Protocol {
+    pub fn detect_event_protocol(event: &RecordedEvent) -> Protocol {
         match &event.event {
             Some(recorded_event::Event::PgMessage(_)) => Protocol::Postgres,
             Some(recorded_event::Event::RedisCommand(_))
@@ -225,8 +224,23 @@ impl RecordingIndex {
         }
     }
 
-    /// Check if event is a client request (vs server response)
-    fn is_client_request(event: &RecordedEvent) -> bool {
+    /// Check if event is a client-side event using direction field,
+    /// falling back to event type heuristic
+    fn is_client_event(event: &RecordedEvent) -> bool {
+        // Primary: use direction field
+        if event.direction == EventDirection::ClientToServer as i32 {
+            return true;
+        }
+        if event.direction == EventDirection::ServerToClient as i32 {
+            return false;
+        }
+
+        // Fallback: classify by event type
+        Self::is_client_request_by_type(event)
+    }
+
+    /// Classify by event type (for legacy recordings without direction field)
+    fn is_client_request_by_type(event: &RecordedEvent) -> bool {
         use crate::events::pg_message_event;
 
         match &event.event {
@@ -244,14 +258,13 @@ impl RecordingIndex {
             Some(recorded_event::Event::RedisCommand(_)) => true,
             Some(recorded_event::Event::HttpRequest(_)) => true,
             Some(recorded_event::Event::GrpcRequest(_)) => true,
+            Some(recorded_event::Event::TcpData(data)) => data.is_client,
             _ => false,
         }
     }
 
     /// Serialize a response event to bytes
     fn serialize_response(event: &RecordedEvent) -> Option<Bytes> {
-        // use crate::events::pg_message_event;
-
         match &event.event {
             Some(recorded_event::Event::PgMessage(msg)) => {
                 if let Some(m) = &msg.message {
@@ -269,6 +282,9 @@ impl RecordingIndex {
             Some(inner @ recorded_event::Event::GrpcResponse(_)) => {
                 crate::protocols::grpc::GrpcSerializer::serialize_message(inner)
             }
+            Some(recorded_event::Event::TcpData(data)) if !data.is_client => {
+                Some(Bytes::copy_from_slice(&data.data))
+            }
             _ => None,
         }
     }
@@ -279,14 +295,14 @@ mod tests {
     use super::*;
     use crate::events::{HttpRequestEvent, HttpResponseEvent};
 
-    fn create_http_request(trace_id: &str, path: &str, seq: u64) -> RecordedEvent {
+    fn create_http_request(trace_id: &str, scope_id: &str, path: &str, seq: u64) -> RecordedEvent {
         RecordedEvent {
             trace_id: trace_id.to_string(),
-            span_id: "span".to_string(),
-            parent_span_id: None,
-            sequence: seq,
+            scope_id: scope_id.to_string(),
+            scope_sequence: seq,
+            global_sequence: seq,
             timestamp_ns: seq * 1000,
-            connection_id: "conn-1".to_string(),
+            direction: EventDirection::ClientToServer as i32,
             event: Some(recorded_event::Event::HttpRequest(HttpRequestEvent {
                 method: "GET".to_string(),
                 path: path.to_string(),
@@ -299,14 +315,14 @@ mod tests {
         }
     }
 
-    fn create_http_response(trace_id: &str, status: u32, seq: u64) -> RecordedEvent {
+    fn create_http_response(trace_id: &str, scope_id: &str, status: u32, seq: u64) -> RecordedEvent {
         RecordedEvent {
             trace_id: trace_id.to_string(),
-            span_id: "span".to_string(),
-            parent_span_id: None,
-            sequence: seq,
+            scope_id: scope_id.to_string(),
+            scope_sequence: seq,
+            global_sequence: seq,
             timestamp_ns: seq * 1000,
-            connection_id: "conn-1".to_string(),
+            direction: EventDirection::ServerToClient as i32,
             event: Some(recorded_event::Event::HttpResponse(HttpResponseEvent {
                 status,
                 headers: Default::default(),
@@ -319,34 +335,27 @@ mod tests {
 
     #[test]
     fn test_build_index_from_recordings() {
+        let scope = "trace:trace-1:conn:0";
         let recordings = vec![
-            create_http_request("trace-1", "/api/users", 0),
-            create_http_response("trace-1", 200, 1),
-            create_http_request("trace-1", "/api/posts", 2),
-            create_http_response("trace-1", 201, 3),
+            create_http_request("trace-1", scope, "/api/users", 0),
+            create_http_response("trace-1", scope, 200, 1),
+            create_http_request("trace-1", scope, "/api/posts", 2),
+            create_http_response("trace-1", scope, 201, 3),
         ];
 
         let index = RecordingIndex::from_recordings(&recordings);
-
-        // Should have one trace
         assert_eq!(index.trace_count(), 1);
 
-        // Should have two HTTP message exchanges
-        let trace = index.get_trace("trace-1").unwrap();
-        assert_eq!(trace.message_count(Protocol::Http), 2);
-
-        // First exchange
-        let ex0 = index.get("trace-1", Protocol::Http, 0).unwrap();
-        assert_eq!(ex0.sequence, 0);
+        let scope_id = ScopeId::from_raw(scope);
+        let ex0 = index.get_exchange("trace-1", &scope_id, 0).unwrap();
+        assert_eq!(ex0.scope_sequence, 0);
         if let Some(recorded_event::Event::HttpRequest(req)) = &ex0.client_message.event {
             assert_eq!(req.path, "/api/users");
         } else {
             panic!("Expected HTTP request");
         }
 
-        // Second exchange
-        let ex1 = index.get("trace-1", Protocol::Http, 1).unwrap();
-        assert_eq!(ex1.sequence, 1);
+        let ex1 = index.get_exchange("trace-1", &scope_id, 2).unwrap();
         if let Some(recorded_event::Event::HttpRequest(req)) = &ex1.client_message.event {
             assert_eq!(req.path, "/api/posts");
         } else {
@@ -355,41 +364,21 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_trace_index() {
+    fn test_multi_scope_index() {
+        let scope_a = "trace:t1:conn:0";
+        let scope_b = "trace:t1:conn:1";
+
         let recordings = vec![
-            create_http_request("trace-A", "/a", 0),
-            create_http_response("trace-A", 200, 1),
-            create_http_request("trace-B", "/b", 0),
-            create_http_response("trace-B", 200, 1),
+            create_http_request("t1", scope_a, "/a", 0),
+            create_http_response("t1", scope_a, 200, 1),
+            create_http_request("t1", scope_b, "/b", 0),
+            create_http_response("t1", scope_b, 200, 1),
         ];
 
         let index = RecordingIndex::from_recordings(&recordings);
+        assert_eq!(index.trace_count(), 1);
 
-        assert_eq!(index.trace_count(), 2);
-
-        let trace_a = index.get("trace-A", Protocol::Http, 0).unwrap();
-        let trace_b = index.get("trace-B", Protocol::Http, 0).unwrap();
-
-        if let Some(recorded_event::Event::HttpRequest(req)) = &trace_a.client_message.event {
-            assert_eq!(req.path, "/a");
-        }
-        if let Some(recorded_event::Event::HttpRequest(req)) = &trace_b.client_message.event {
-            assert_eq!(req.path, "/b");
-        }
-    }
-
-    #[test]
-    fn test_protocol_detection() {
-        let http_req = create_http_request("t", "/", 0);
-        assert_eq!(
-            RecordingIndex::detect_event_protocol(&http_req),
-            Protocol::Http
-        );
-
-        let http_resp = create_http_response("t", 200, 0);
-        assert_eq!(
-            RecordingIndex::detect_event_protocol(&http_resp),
-            Protocol::Http
-        );
+        let trace = index.get_trace("t1").unwrap();
+        assert_eq!(trace.scopes.len(), 2);
     }
 }

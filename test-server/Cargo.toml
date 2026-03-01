@@ -12,14 +12,27 @@ path = "src/main.rs"
 tonic = "0.13"
 prost = "0.13"
 
+# HTTP frameworks
+axum = "0.7"
+actix-web = "4"
+actix-rt = "2"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace"] }
+
 # Async runtime
 tokio = { version = "1.32", features = ["full", "rt-multi-thread"] }
+tokio-stream = "0.1.18"
+futures = "0.3"
 
 # HTTP client for outgoing requests
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
 # Deja SDK for non-deterministic operations
-deja-sdk = { path = "../sdk" }
+deja-sdk = { path = "../sdk", features = ["axum", "tonic", "sqlx"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }
+redis = { version = "0.25", features = ["tokio-comp"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -36,10 +49,6 @@ async-trait = "0.1"
 thiserror = "1.0"
 rand = "0.8"
 
-# For embedded mock backend
-axum = "0.7"
-futures = "0.3"
-
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 
@@ -48,3 +57,5 @@ tonic-build = "0.13"
 
 [dev-dependencies]
 tempfile = "3.8"
+deja-core = { path = "../core" }
+deja-common = { path = "../common" }

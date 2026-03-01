@@ -2,7 +2,6 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::sync::Arc;
-use x509_parser::prelude::*;
 
 pub struct TlsMitmManager {
     ca_cert: rcgen::Certificate,
@@ -28,41 +27,28 @@ impl TlsMitmManager {
             .next()
             .ok_or("No CA certificate found in PEM")?;
 
-        // Parse the original certificate to extract its subject DN
-        // This ensures server certificates have matching issuer fields
-        let (_, parsed_cert) = X509Certificate::from_der(ca_cert_der.as_ref())
-            .map_err(|e| format!("Failed to parse CA certificate: {:?}", e))?;
+        eprintln!(
+            "[TLS-MITM] Loaded original CA cert, DER length: {}",
+            ca_cert_der.len()
+        );
 
-        // Build rcgen CertificateParams with the SAME subject as the original CA
-        let mut params = CertificateParams::default();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        // Load the existing CA certificate using rcgen's CertificateParams::from_ca_cert_pem
+        // Then create a self-signed Certificate that can be used as an issuer
+        let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
+            .map_err(|e| format!("Failed to load CA cert params: {:?}", e))?;
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .map_err(|e| format!("Failed to create CA certificate: {:?}", e))?;
 
-        // Copy subject from original certificate
-        let mut dn = DistinguishedName::new();
-        for rdn in parsed_cert.subject().iter() {
-            for attr in rdn.iter() {
-                if let Ok(value) = attr.as_str() {
-                    match attr.attr_type().to_id_string().as_str() {
-                        "2.5.4.6" => dn.push(DnType::CountryName, value), // C
-                        "2.5.4.8" => dn.push(DnType::StateOrProvinceName, value), // ST
-                        "2.5.4.10" => dn.push(DnType::OrganizationName, value), // O
-                        "2.5.4.3" => dn.push(DnType::CommonName, value),  // CN
-                        "2.5.4.7" => dn.push(DnType::LocalityName, value), // L
-                        "2.5.4.11" => dn.push(DnType::OrganizationalUnitName, value), // OU
-                        _ => {}                                           // Skip unknown OIDs
-                    }
-                }
-            }
-        }
-        params.distinguished_name = dn;
-
-        let ca_cert = params.self_signed(&ca_key)?;
+        eprintln!(
+            "[TLS-MITM] Loaded CA certificate using rcgen::CertificateParams::from_ca_cert_pem"
+        );
 
         let mut root_cert_store = RootCertStore::empty();
         // Load system/public roots so we can talk to real upstreams
         root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        // Add our custom CA for upstream validation
+        // Add our custom CA for upstream validation (use the original CA cert)
         root_cert_store.add(ca_cert_der.clone())?;
 
         Ok(Self {
@@ -80,17 +66,27 @@ impl TlsMitmManager {
         let mut params = CertificateParams::default();
         params.distinguished_name = DistinguishedName::new();
         params.distinguished_name.push(DnType::CommonName, host);
-        params.subject_alt_names = vec![SanType::DnsName(host.to_string().try_into()?)];
+
+        let san = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            SanType::IpAddress(ip)
+        } else {
+            SanType::DnsName(host.to_string().try_into()?)
+        };
+        params.subject_alt_names = vec![san];
 
         let key_pair = KeyPair::generate()?;
         let cert = params.signed_by(&key_pair, &self.ca_cert, &self.ca_key)?;
 
-        // Include both the server cert AND the original CA cert in the chain
-        let cert_chain = vec![
-            CertificateDer::from(cert.der().to_vec()),
-            self.ca_cert_der.clone(),
-        ];
+        // DON'T include the CA cert in the chain - clients should already have it
+        // in their trust store.
+        let cert_chain = vec![CertificateDer::from(cert.der().to_vec())];
         let key_der = PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+
+        eprintln!(
+            "[TLS-MITM] Generated server cert for host: {}, chain length: {}",
+            host,
+            cert_chain.len()
+        );
 
         let config = ServerConfig::builder()
             .with_no_client_auth()

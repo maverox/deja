@@ -17,32 +17,55 @@ use tokio::time::sleep;
 #[tokio::test]
 async fn test_nondeterministic_uuid_generation() {
     // For now, test the SDK directly without full proxy integration
-    use deja_sdk::{DejaRuntime, ProductionRuntime};
+    // Use Runtime with a dummy proxy URL - run() still works
+    // even if the proxy is unreachable (capture sends fail silently)
+    use deja_sdk::{DejaMode, Runtime};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let runtime = ProductionRuntime::new();
+    let runtime = Runtime::new("http://localhost:19999".to_string(), DejaMode::Record);
 
-    // Generate UUIDs
-    let uuid1 = runtime.uuid().await;
-    let uuid2 = runtime.uuid().await;
+    // Generate UUIDs - user brings their own uuid crate
+    let uuid1: uuid::Uuid = deja_sdk::deja_run(&runtime, "uuid", || uuid::Uuid::new_v4()).await;
+    let uuid2: uuid::Uuid = deja_sdk::deja_run(&runtime, "uuid", || uuid::Uuid::new_v4()).await;
 
-    // They should be different in production mode
+    // They should be different in record mode (each call generates new value)
     assert_ne!(uuid1, uuid2, "UUIDs should be unique");
     assert_eq!(uuid1.as_bytes().len(), 16, "UUID should be 16 bytes");
 
     println!("✅ UUID1: {}", uuid1);
     println!("✅ UUID2: {}", uuid2);
 
-    // Test timestamps
-    let ts1 = runtime.now_millis().await;
+    // Test timestamps - user brings their own time handling
+    let ts1: u64 = deja_sdk::deja_run(&runtime, "time", || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }).await;
     sleep(Duration::from_millis(10)).await;
-    let ts2 = runtime.now_millis().await;
+    let ts2: u64 = deja_sdk::deja_run(&runtime, "time", || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }).await;
 
     assert!(ts2 > ts1, "Timestamps should increase");
     println!("⏱️ TS1: {}, TS2: {}, diff: {}ms", ts1, ts2, ts2 - ts1);
 
-    // Test random bytes
-    let random1 = runtime.random_bytes(16).await;
-    let random2 = runtime.random_bytes(16).await;
+    // Test random bytes - user brings their own rand crate
+    let random1: Vec<u8> = deja_sdk::deja_run(&runtime, "random_bytes", || {
+        use rand::Rng;
+        let mut bytes = vec![0u8; 16];
+        rand::thread_rng().fill(&mut bytes[..]);
+        bytes
+    }).await;
+    let random2: Vec<u8> = deja_sdk::deja_run(&runtime, "random_bytes", || {
+        use rand::Rng;
+        let mut bytes = vec![0u8; 16];
+        rand::thread_rng().fill(&mut bytes[..]);
+        bytes
+    }).await;
 
     assert_eq!(random1.len(), 16);
     assert_eq!(random2.len(), 16);
@@ -57,18 +80,16 @@ async fn test_nondeterministic_uuid_generation() {
 /// Test custom capture functionality
 #[tokio::test]
 async fn test_custom_capture() {
-    use deja_sdk::{DejaRuntime, ProductionRuntime};
+    use deja_sdk::{DejaMode, DejaRuntime, Runtime};
 
-    let runtime = ProductionRuntime::new();
+    // Test replay mode - should return None if no proxy available
+    let runtime = Runtime::new("http://localhost:19999".to_string(), DejaMode::Replay);
 
-    // In production mode, capture is a no-op
-    runtime.capture("test_tag", "test_value").await;
-
-    // In production mode, replay returns None
-    let replayed = runtime.replay("test_tag").await;
+    // In replay mode without a running proxy, replay returns None
+    let replayed = runtime.replay_value("test_tag").await;
     assert!(
         replayed.is_none(),
-        "Production mode should return None for replay"
+        "Replay without proxy should return None"
     );
 
     println!("✅ Custom capture test passed!");

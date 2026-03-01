@@ -1,13 +1,15 @@
 syntax = "proto3";
 package deja.v1;
 
+// ============ Core Event ============
+
 message RecordedEvent {
   string trace_id = 1;
-  string span_id = 2;
-  optional string parent_span_id = 3;
-  uint64 sequence = 4;
+  string scope_id = 2;              // Hierarchical scope path (e.g., "trace:abc:conn:0:stream:3")
+  uint64 scope_sequence = 3;        // Order within this scope (primary replay key)
+  uint64 global_sequence = 4;       // Cross-scope temporal order (debug only)
   uint64 timestamp_ns = 5;
-  string connection_id = 6;
+  EventDirection direction = 6;
 
   oneof event {
     HttpRequestEvent http_request = 10;
@@ -23,10 +25,55 @@ message RecordedEvent {
     PgMessageEvent pg_message = 20;
     GrpcRequestEvent grpc_request = 21;
     GrpcResponseEvent grpc_response = 22;
+    TcpDataEvent tcp_data = 23;
+    ConnectionEvent connection = 24;
+    SessionStateEvent session_state = 25;
   }
 
   map<string, string> metadata = 100;
 }
+
+enum EventDirection {
+  DIRECTION_UNKNOWN = 0;
+  CLIENT_TO_SERVER = 1;
+  SERVER_TO_CLIENT = 2;
+}
+
+// ============ Connection Lifecycle ============
+
+message ConnectionEvent {
+  ConnectionEventType event_type = 1;
+  string local_addr = 2;
+  string remote_addr = 3;
+  bool is_tls = 4;
+  string protocol = 5;
+  string error_message = 6;
+}
+
+enum ConnectionEventType {
+  CONNECTION_OPENED = 0;
+  CONNECTION_CLOSED = 1;
+  CONNECTION_ERROR = 2;
+  CONNECTION_TLS_ESTABLISHED = 3;
+}
+
+// ============ Session State ============
+
+message SessionStateEvent {
+  SessionStateType state_type = 1;
+  string detail = 2;
+}
+
+enum SessionStateType {
+  SESSION_PG_BEGIN = 0;
+  SESSION_PG_COMMIT = 1;
+  SESSION_PG_ROLLBACK = 2;
+  SESSION_REDIS_MULTI = 10;
+  SESSION_REDIS_EXEC = 11;
+  SESSION_REDIS_DISCARD = 12;
+}
+
+// ============ HTTP ============
 
 message HttpRequestEvent {
   string method = 1;
@@ -44,10 +91,11 @@ message HttpResponseEvent {
    uint64 latency_ms = 4;
 }
 
+// ============ Database ============
+
 message DbQueryEvent {
   DbType db_type = 1;
   string query = 2;
-  // params would be complex to serialize, simplified for now
   string connection_id = 4;
 }
 
@@ -61,8 +109,9 @@ enum DbType {
 
 message DbResultEvent {
     uint64 affected_rows = 1;
-    // Result set data omitted for brevity in Phase 1
 }
+
+// ============ Cache ============
 
 message CacheGetEvent {
   CacheType cache_type = 1;
@@ -85,11 +134,14 @@ message CacheSetEvent {
     optional uint64 ttl_ms = 4;
 }
 
+// ============ External Call ============
+
 message ExternalCallEvent {
     string service_name = 1;
-    // Recursive or simplified? Phase 1: simplified
     string operation = 2;
 }
+
+// ============ Non-Deterministic Values ============
 
 message NonDeterministicEvent {
     oneof kind {
@@ -97,8 +149,12 @@ message NonDeterministicEvent {
         uint64 random_seed_capture = 2;
         string uuid_capture = 3;
         string task_spawn_capture = 4;
+        bytes random_bytes_capture = 5;
+        string nanoid_capture = 6;
     }
 }
+
+// ============ Redis ============
 
 message RedisCommandEvent {
     string command = 1;
@@ -138,12 +194,7 @@ message RedisArray {
     repeated RedisValue values = 1;
 }
 
-// Postgres Specifics
-
-// Extends DbResultEvent or used within it? 
-// For now, let's keep DB events somewhat generic but with specific details.
-// Actually, let's use the DbResultEvent for generic summary, but maybe we need a PgRowEvent?
-// No, protocol level events are better.
+// ============ Postgres ============
 
 message PgMessageEvent {
     oneof message {
@@ -183,7 +234,6 @@ message PgReadyForQuery {
     string status = 1; // 'I', 'T', or 'E'
 }
 
-
 message PgStartup {
     string user = 1;
     string database = 2;
@@ -202,7 +252,6 @@ message PgParse {
 message PgBind {
     string portal = 1;
     string statement = 2;
-    // params omitted for brevity in Phase 3 start
 }
 
 message PgExecute {
@@ -221,7 +270,7 @@ message PgColumn {
 }
 
 message PgDataRow {
-    repeated bytes values = 1; // null can be empty bytes for now or we need a wrapper
+    repeated bytes values = 1;
 }
 
 message PgCommandComplete {
@@ -230,7 +279,6 @@ message PgCommandComplete {
 
 // ============ gRPC Protocol Events ============
 
-// gRPC call types
 enum GrpcCallType {
     GRPC_CALL_TYPE_UNSPECIFIED = 0;
     GRPC_CALL_TYPE_UNARY = 1;
@@ -239,7 +287,6 @@ enum GrpcCallType {
     GRPC_CALL_TYPE_BIDI_STREAMING = 4;
 }
 
-// Standard gRPC status codes
 enum GrpcStatusCode {
     GRPC_STATUS_OK = 0;
     GRPC_STATUS_CANCELLED = 1;
@@ -260,38 +307,29 @@ enum GrpcStatusCode {
     GRPC_STATUS_UNAUTHENTICATED = 16;
 }
 
-// gRPC request event - captures a unary RPC call from client
 message GrpcRequestEvent {
-    // Full service name (e.g., "grpc.health.v1.Health")
     string service = 1;
-    // Method name (e.g., "Check")
     string method = 2;
-    // Request message body (serialized protobuf)
     bytes request_body = 3;
-    // gRPC metadata (like HTTP headers)
     map<string, string> metadata = 4;
-    // Call type (unary, streaming, etc.)
     GrpcCallType call_type = 5;
-    // HTTP/2 stream ID for correlation
     uint32 stream_id = 6;
-    // Authority (host:port) from :authority pseudo-header
     string authority = 7;
 }
 
-// gRPC response event - captures response from server
 message GrpcResponseEvent {
-    // Response message body (serialized protobuf)
     bytes response_body = 1;
-    // gRPC status code
     GrpcStatusCode status_code = 2;
-    // Status message (for non-OK status)
     string status_message = 3;
-    // Response metadata (headers)
     map<string, string> metadata = 4;
-    // Trailing metadata (trailers)
     map<string, string> trailers = 5;
-    // Latency in milliseconds
     uint64 latency_ms = 6;
-    // HTTP/2 stream ID for correlation
     uint32 stream_id = 7;
+}
+
+// ============ TCP Raw ============
+
+message TcpDataEvent {
+    bytes data = 1;
+    bool is_client = 2; // true = client->server, false = server->client
 }

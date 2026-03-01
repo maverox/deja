@@ -1,15 +1,14 @@
 pub mod config;
 pub mod control_api;
 pub mod diff;
-pub mod hash;
 pub mod protocols;
 pub mod recording;
 pub mod replay;
 pub mod runtime;
+pub mod storage;
 pub mod tls_mitm;
 
 // Re-export trace context and spawning functions for easy access
-pub use runtime::trace_context::{current_trace_id, generate_trace_id, with_trace_id};
 pub use runtime::spawn::{spawn, spawn_blocking, get_blocking_trace_id};
 pub use runtime::pool_interceptor::InterceptedConnection;
 

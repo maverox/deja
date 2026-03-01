@@ -71,6 +71,7 @@ pub struct InterceptedTcpStream {
     /// The underlying Tokio stream
     inner: TokioTcpStream,
     /// Control client to notify proxy (optional)
+    #[allow(dead_code)] // Future: connection lifecycle notifications
     control_client: Option<Arc<ControlClient>>,
     /// Local address of the connection
     local_addr: Option<String>,
@@ -120,24 +121,28 @@ impl InterceptedTcpStream {
         );
 
         // Notify proxy if we have a trace context and control client
-        if let (Some(client), Some(remote)) = (control_client.as_ref(), remote_addr.as_ref()) {
+        if let Some(client) = control_client.as_ref() {
             if let Some(trace_id) = trace_context::current_trace_id() {
-                debug!(
-                    trace_id = %trace_id,
-                    connection = %remote,
-                    "Notifying proxy of connection association"
-                );
+                if let Ok(local) = inner.local_addr() {
+                    let source_port = local.port();
+                    debug!(
+                        trace_id = %trace_id,
+                        source_port = source_port,
+                        "Notifying proxy of connection association by source port"
+                    );
 
-                let msg = crate::control_api::ControlMessage::associate_connection(
-                    trace_id,
-                    remote.clone(),
-                );
+                    let msg = crate::control_api::ControlMessage::associate_by_source_port(
+                        trace_id,
+                        source_port,
+                        deja_common::Protocol::Unknown,
+                    );
 
-                // Fire and forget - don't fail the connection if notification fails
-                let client_clone = client.clone();
-                tokio::spawn(async move {
-                    let _ = client_clone.send(msg).await;
-                });
+                    // Fire and forget - don't fail the connection if notification fails
+                    let client_clone = client.clone();
+                    tokio::spawn(async move {
+                        let _ = client_clone.send(msg).await;
+                    });
+                }
             }
         }
 

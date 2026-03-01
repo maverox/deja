@@ -11,9 +11,15 @@ async fn test_postgres_replay_responses() -> Result<(), Box<dyn std::error::Erro
     let temp_dir = tempfile::tempdir()?;
     let file_path = temp_dir.path().join("trace_pg.jsonl");
 
-    // 1. Query
+    let trace_id = "pg-test";
+    let scope_id = "trace:pg-test:conn:0";
+
+    // 1. Query (client → server)
     let evt1 = RecordedEvent {
-        sequence: 1,
+        trace_id: trace_id.to_string(),
+        scope_id: scope_id.to_string(),
+        scope_sequence: 0,
+        direction: 1, // CLIENT_TO_SERVER
         event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
             message: Some(pg_message_event::Message::Query(PgQuery {
                 query: "SELECT 1".to_string(),
@@ -21,9 +27,12 @@ async fn test_postgres_replay_responses() -> Result<(), Box<dyn std::error::Erro
         })),
         ..Default::default()
     };
-    // 2. DataRow
+    // 2. DataRow (server → client)
     let evt2 = RecordedEvent {
-        sequence: 2,
+        trace_id: trace_id.to_string(),
+        scope_id: scope_id.to_string(),
+        scope_sequence: 1,
+        direction: 2, // SERVER_TO_CLIENT
         event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
             message: Some(pg_message_event::Message::DataRow(PgDataRow {
                 values: vec![vec![49]], // "1"
@@ -31,9 +40,12 @@ async fn test_postgres_replay_responses() -> Result<(), Box<dyn std::error::Erro
         })),
         ..Default::default()
     };
-    // 3. CommandComplete
+    // 3. CommandComplete (server → client)
     let evt3 = RecordedEvent {
-        sequence: 3,
+        trace_id: trace_id.to_string(),
+        scope_id: scope_id.to_string(),
+        scope_sequence: 2,
+        direction: 2,
         event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
             message: Some(pg_message_event::Message::CommandComplete(
                 PgCommandComplete {
@@ -43,9 +55,12 @@ async fn test_postgres_replay_responses() -> Result<(), Box<dyn std::error::Erro
         })),
         ..Default::default()
     };
-    // 4. ReadyForQuery
+    // 4. ReadyForQuery (server → client)
     let evt4 = RecordedEvent {
-        sequence: 4,
+        trace_id: trace_id.to_string(),
+        scope_id: scope_id.to_string(),
+        scope_sequence: 3,
+        direction: 2,
         event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
             message: Some(pg_message_event::Message::ReadyForQuery(PgReadyForQuery {
                 status: "I".to_string(), // Idle
@@ -65,8 +80,11 @@ async fn test_postgres_replay_responses() -> Result<(), Box<dyn std::error::Erro
     // Load Engine
     let mut engine = ReplayEngine::new(temp_dir.path()).await?;
 
-    // Match Query
+    // Match Query — incoming needs same trace_id and scope_id for scope-based matching
     let incoming = RecordedEvent {
+        trace_id: trace_id.to_string(),
+        scope_id: scope_id.to_string(),
+        direction: 1,
         event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
             message: Some(pg_message_event::Message::Query(PgQuery {
                 query: "SELECT 1".to_string(),

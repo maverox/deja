@@ -11,9 +11,8 @@
 //! 5. Extracts x-trace-id headers for correlation with the originating request
 
 use crate::correlation::TraceCorrelator;
-use deja_common::Protocol;
-use deja_core::events::{recorded_event, HttpRequestEvent, HttpResponseEvent, RecordedEvent};
-use deja_core::protocols::http::HttpParser;
+use deja_common::ScopeId;
+use deja_core::events::{recorded_event, EventDirection, HttpRequestEvent, HttpResponseEvent, RecordedEvent};
 use deja_core::recording::Recorder;
 use deja_core::replay::ReplayEngine;
 use deja_core::tls_mitm::TlsMitmManager;
@@ -53,10 +52,11 @@ pub async fn start_forward_proxy(
                 let rec = recorder.clone();
                 let rep = replay_engine.clone();
                 let corr = correlator.clone();
+                let peer_port = peer_addr.port();
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_forward_proxy_connection(client_socket, tls_mgr, rec, rep, corr)
+                        handle_forward_proxy_connection(client_socket, peer_port, tls_mgr, rec, rep, corr)
                             .await
                     {
                         error!("[ForwardProxy] Connection error: {}", e);
@@ -77,6 +77,7 @@ pub async fn start_forward_proxy(
 #[instrument(skip(client_socket, tls_manager, recorder, replay_engine, correlator))]
 async fn handle_forward_proxy_connection(
     mut client_socket: TcpStream,
+    peer_port: u16,
     tls_manager: Arc<TlsMitmManager>,
     recorder: Option<Arc<Recorder>>,
     replay_engine: Option<Arc<Mutex<ReplayEngine>>>,
@@ -134,6 +135,7 @@ async fn handle_forward_proxy_connection(
     // Now the client will start TLS handshake - we perform MITM
     handle_tls_tunnel(
         client_socket,
+        peer_port,
         &host,
         port,
         tls_manager,
@@ -145,7 +147,9 @@ async fn handle_forward_proxy_connection(
 }
 
 /// Parse host:port string into (host, port) tuple
-fn parse_host_port(host_port: &str) -> Result<(String, u16), Box<dyn std::error::Error + Send + Sync>> {
+fn parse_host_port(
+    host_port: &str,
+) -> Result<(String, u16), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(colon_pos) = host_port.rfind(':') {
         let host = &host_port[..colon_pos];
         let port_str = &host_port[colon_pos + 1..];
@@ -165,6 +169,7 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16), Box<dyn std::error:
 #[instrument(skip(client_socket, tls_manager, recorder, replay_engine, correlator))]
 async fn handle_tls_tunnel(
     client_socket: TcpStream,
+    peer_port: u16,
     target_host: &str,
     target_port: u16,
     tls_manager: Arc<TlsMitmManager>,
@@ -172,6 +177,44 @@ async fn handle_tls_tunnel(
     replay_engine: Option<Arc<Mutex<ReplayEngine>>>,
     correlator: Arc<TraceCorrelator>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // === Connection-level trace correlation via source-port ===
+    // The SDK's socket_interceptor reports associate_by_source_port() when connecting
+    // to the forward proxy. Use that as the primary correlation mechanism.
+    let connection_assoc = match correlator
+        .on_new_connection(peer_port, deja_common::Protocol::Http)
+        .await
+    {
+        Ok(assoc) => {
+            debug!(
+                trace_id = %assoc.trace_id,
+                scope_id = %assoc.scope_id,
+                peer_port = peer_port,
+                "[ForwardProxy] Source-port correlation resolved immediately"
+            );
+            Some(assoc)
+        }
+        Err(rx) => {
+            // SDK hasn't registered yet — wait briefly for the association
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx).await {
+                Ok(Ok(assoc)) => {
+                    debug!(
+                        trace_id = %assoc.trace_id,
+                        scope_id = %assoc.scope_id,
+                        "[ForwardProxy] Source-port correlation resolved after wait"
+                    );
+                    Some(assoc)
+                }
+                _ => {
+                    debug!(
+                        peer_port = peer_port,
+                        "[ForwardProxy] Source-port correlation timed out, will use header fallback"
+                    );
+                    None
+                }
+            }
+        }
+    };
+
     // Generate server config for this host (dynamically signed certificate)
     let server_config = tls_manager.generate_server_config(target_host)?;
     let acceptor = TlsAcceptor::from(server_config);
@@ -219,12 +262,12 @@ async fn handle_tls_tunnel(
         (None, None)
     };
 
-    // Create connection ID for this tunnel
-    let connection_id = uuid::Uuid::new_v4().to_string();
-    let _http_parser = HttpParser; // Keep for potential future use
-
-    // Track current trace_id extracted from x-trace-id header
-    let current_trace_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Connection-level scope: resolved once, shared by all requests on this tunnel.
+    // If source-port resolved it, use that. Otherwise, the first request's x-trace-id
+    // header will allocate the scope (fallback for non-SDK clients).
+    let conn_scope: Arc<Mutex<Option<(String, ScopeId)>>> = Arc::new(Mutex::new(
+        connection_assoc.map(|a| (a.trace_id, a.scope_id)),
+    ));
 
     // Client -> Target handler
     let client_write_clone = client_write.clone();
@@ -232,8 +275,7 @@ async fn handle_tls_tunnel(
     let recorder_clone = recorder.clone();
     let replay_engine_clone = replay_engine.clone();
     let correlator_clone = correlator.clone();
-    let connection_id_clone = connection_id.clone();
-    let current_trace_clone = current_trace_id.clone();
+    let conn_scope_clone = conn_scope.clone();
     let target_host_owned = target_host.to_string();
 
     let client_to_target = async move {
@@ -265,31 +307,49 @@ async fn handle_tls_tunnel(
                         );
                     }
 
-                    // Extract x-trace-id for correlation
-                    let trace_id = header_map
-                        .get("x-trace-id")
-                        .cloned()
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    // Resolve (trace_id, scope_id) — prefer connection-level association,
+                    // fall back to x-trace-id header if source-port didn't resolve.
+                    let (trace_id, scope_id) = {
+                        let mut scope_guard = conn_scope_clone.lock().await;
+                        let request_trace = header_map.get("x-trace-id").cloned();
+
+                        if let Some((existing_trace, existing_scope)) = scope_guard.as_ref().cloned() {
+                            if let Some(ref requested_trace) = request_trace {
+                                if requested_trace != &existing_trace {
+                                    let new_scope = correlator_clone
+                                        .allocate_connection_id(requested_trace)
+                                        .await;
+                                    debug!(
+                                        old_trace_id = %existing_trace,
+                                        new_trace_id = %requested_trace,
+                                        new_scope_id = %new_scope,
+                                        "[ForwardProxy] Updating keep-alive tunnel association"
+                                    );
+                                    *scope_guard = Some((requested_trace.clone(), new_scope.clone()));
+                                    (requested_trace.clone(), new_scope)
+                                } else {
+                                    (existing_trace, existing_scope)
+                                }
+                            } else {
+                                (existing_trace, existing_scope)
+                            }
+                        } else {
+                            let tid = request_trace.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let sid = correlator_clone.allocate_connection_id(&tid).await;
+                            debug!(
+                                trace_id = %tid,
+                                scope_id = %sid,
+                                "[ForwardProxy] Using header-based trace fallback"
+                            );
+                            *scope_guard = Some((tid.clone(), sid.clone()));
+                            (tid, sid)
+                        }
+                    };
 
                     debug!(
-                        "[ForwardProxy] HTTP {} {} (trace: {})",
-                        method, path, trace_id
+                        "[ForwardProxy] HTTP {} {} (trace: {}, scope: {})",
+                        method, path, trace_id, scope_id
                     );
-
-                    // Store current trace_id
-                    {
-                        let mut tid = current_trace_clone.lock().await;
-                        *tid = Some(trace_id.clone());
-                    }
-
-                    // Associate this connection with the trace
-                    correlator_clone
-                        .associate_connection_with_protocol(
-                            connection_id_clone.clone(),
-                            trace_id.clone(),
-                            Protocol::Http,
-                        )
-                        .await;
 
                     // Get content length
                     let content_length = header_map
@@ -307,21 +367,22 @@ async fn handle_tls_tunnel(
                     // Extract body
                     let body = request_buf[head_len..total_len].to_vec();
 
-                    // Get sequence number
+                    // Get sequence number within this connection scope
                     let sequence = correlator_clone
-                        .next_sequence(&trace_id, Protocol::Http)
+                        .next_scope_sequence(&scope_id)
                         .await;
 
                     // Create event
                     let event = RecordedEvent {
                         trace_id: trace_id.clone(),
-                        span_id: uuid::Uuid::new_v4().to_string(),
-                        sequence,
+                        scope_id: scope_id.as_str().to_string(),
+                        scope_sequence: sequence,
+                        global_sequence: correlator_clone.next_global_sequence().await,
                         timestamp_ns: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_nanos() as u64,
-                        connection_id: connection_id_clone.clone(),
+                        direction: EventDirection::ClientToServer as i32,
                         event: Some(recorded_event::Event::HttpRequest(HttpRequestEvent {
                             method: method.clone(),
                             path: path.clone(),
@@ -330,7 +391,7 @@ async fn handle_tls_tunnel(
                             schema: "https".to_string(),
                             host: target_host_owned.clone(),
                         })),
-                        ..Default::default()
+                        metadata: Default::default(),
                     };
 
                     // Record or replay
@@ -343,10 +404,7 @@ async fn handle_tls_tunnel(
                         if let Some((_, _response_events, response_bytes)) =
                             engine.find_match_with_responses(&event)
                         {
-                            info!(
-                                "[ForwardProxy] Replay match found for {} {}",
-                                method, path
-                            );
+                            info!("[ForwardProxy] Replay match found for {} {}", method, path);
                             let mut cw = client_write_clone.lock().await;
                             for resp in response_bytes {
                                 cw.write_all(&resp).await?;
@@ -399,8 +457,7 @@ async fn handle_tls_tunnel(
     // Target -> Client handler
     let recorder_clone2 = recorder.clone();
     let correlator_clone2 = correlator.clone();
-    let connection_id_clone2 = connection_id.clone();
-    let current_trace_clone2 = current_trace_id.clone();
+    let conn_scope_clone2 = conn_scope.clone();
 
     let target_to_client = async move {
         if let Some(mut target_read) = target_read {
@@ -446,34 +503,38 @@ async fn handle_tls_tunnel(
 
                         let body = response_buf[head_len..total_len].to_vec();
 
-                        // Get trace_id
-                        let trace_id = {
-                            let tid = current_trace_clone2.lock().await;
-                            tid.clone()
-                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                        // Use the connection-level scope (shared with request handler)
+                        let (trace_id, scope_id) = {
+                            let guard = conn_scope_clone2.lock().await;
+                            guard.clone().unwrap_or_else(|| {
+                                let fallback_id = uuid::Uuid::new_v4().to_string();
+                                let fallback_scope = ScopeId::connection(&fallback_id, 0);
+                                (fallback_id, fallback_scope)
+                            })
                         };
 
                         // Get sequence number
                         let sequence = correlator_clone2
-                            .next_sequence(&trace_id, Protocol::Http)
+                            .next_scope_sequence(&scope_id)
                             .await;
 
                         let event = RecordedEvent {
                             trace_id,
-                            span_id: uuid::Uuid::new_v4().to_string(),
-                            sequence,
+                            scope_id: scope_id.as_str().to_string(),
+                            scope_sequence: sequence,
+                            global_sequence: correlator_clone2.next_global_sequence().await,
                             timestamp_ns: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos() as u64,
-                            connection_id: connection_id_clone2.clone(),
+                            direction: EventDirection::ServerToClient as i32,
                             event: Some(recorded_event::Event::HttpResponse(HttpResponseEvent {
                                 status: status_code,
                                 headers: header_map,
                                 body,
                                 latency_ms: 0,
                             })),
-                            ..Default::default()
+                            metadata: Default::default(),
                         };
 
                         if let Some(rec) = &recorder_clone2 {

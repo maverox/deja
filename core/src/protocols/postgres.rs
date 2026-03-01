@@ -52,8 +52,8 @@ pub struct PostgresConnectionParser {
     client_buf: BytesMut,
     server_buf: BytesMut,
     state: PgState,
-    sequence: u64,
     connection_id: String,
+    is_replay: bool,
 }
 
 enum PgState {
@@ -67,8 +67,8 @@ impl PostgresConnectionParser {
             client_buf: BytesMut::new(),
             server_buf: BytesMut::new(),
             state: PgState::Startup,
-            sequence: 0,
             connection_id,
+            is_replay: false,
         }
     }
 
@@ -103,6 +103,35 @@ impl PostgresConnectionParser {
             database: params.get("database").cloned().unwrap_or_default(),
         })
     }
+
+    fn synthesize_startup_response() -> Bytes {
+        let mut buf = BytesMut::new();
+        // AuthOk
+        buf.extend_from_slice(&PgSerializer::serialize_authentication_ok());
+        // ParameterStatus
+        buf.extend_from_slice(&PgSerializer::serialize_parameter_status(
+            "server_version",
+            "14.0",
+        ));
+        buf.extend_from_slice(&PgSerializer::serialize_parameter_status(
+            "client_encoding",
+            "UTF8",
+        ));
+        buf.extend_from_slice(&PgSerializer::serialize_parameter_status(
+            "DateStyle",
+            "ISO, MDY",
+        ));
+        buf.extend_from_slice(&PgSerializer::serialize_parameter_status(
+            "standard_conforming_strings",
+            "on",
+        ));
+        buf.extend_from_slice(&PgSerializer::serialize_parameter_status("TimeZone", "UTC"));
+        // BackendKeyData (dummy)
+        buf.extend_from_slice(&PgSerializer::serialize_backend_key_data(1234, 5678));
+        // ReadyForQuery
+        buf.extend_from_slice(&PgSerializer::serialize_ready_for_query("I"));
+        buf.freeze()
+    }
 }
 
 fn now_ns() -> u64 {
@@ -110,6 +139,47 @@ fn now_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+/// Extract a Deja trace ID from a PG SET application_name query.
+///
+/// Matches:
+///   SET application_name = 'deja:<trace_id>'
+///   SET LOCAL application_name = 'deja:<trace_id>'
+/// Returns the trace_id portion if found, None otherwise.
+pub fn extract_pg_trace_id(query: &str) -> Option<String> {
+    let q = query.trim();
+    let lower = q.to_lowercase();
+
+    // Must be a SET statement targeting application_name
+    let after_set = if lower.starts_with("set local ") {
+        &lower["set local ".len()..]
+    } else if lower.starts_with("set ") {
+        &lower["set ".len()..]
+    } else {
+        return None;
+    };
+
+    let after_set = after_set.trim();
+    if !after_set.starts_with("application_name") {
+        return None;
+    }
+
+    // Find the value after '='
+    let after_name = after_set["application_name".len()..].trim();
+    let after_eq = after_name.strip_prefix('=')?.trim();
+
+    // Strip surrounding quotes (single or double)
+    let value = if (after_eq.starts_with('\'') && after_eq.ends_with('\''))
+        || (after_eq.starts_with('"') && after_eq.ends_with('"'))
+    {
+        &after_eq[1..after_eq.len() - 1]
+    } else {
+        after_eq
+    };
+
+    // Must start with "deja:" prefix
+    value.strip_prefix("deja:").map(|id| id.to_string())
 }
 
 fn read_null_term_string(buf: &mut BytesMut) -> String {
@@ -129,6 +199,7 @@ impl ConnectionParser for PostgresConnectionParser {
     fn parse_client_data(&mut self, data: &[u8]) -> Result<ParseResult, ParseError> {
         self.client_buf.extend_from_slice(data);
         let mut events = Vec::new();
+        let mut reply = None;
 
         loop {
             if self.client_buf.is_empty() {
@@ -146,7 +217,7 @@ impl ConnectionParser for PostgresConnectionParser {
                         let ver_peek =
                             u32::from_be_bytes(self.client_buf[4..8].try_into().unwrap());
                         if len_peek == 8 && (ver_peek == 80877103 || ver_peek == 80877104) {
-                            // SSL/GSSENC
+                            // SSL/GSSENC -> Cancel
                             let _ = self.client_buf.split_to(8);
                             return Ok(ParseResult {
                                 events: vec![],
@@ -159,18 +230,23 @@ impl ConnectionParser for PostgresConnectionParser {
 
                     if let Some(startup) = Self::parse_startup(&mut self.client_buf) {
                         events.push(RecordedEvent {
-                            trace_id: uuid::Uuid::new_v4().to_string(), // Correlation
-                            span_id: uuid::Uuid::new_v4().to_string(),
+                            trace_id: String::new(),
+                            scope_id: String::new(),
+                            scope_sequence: 0,
+                            global_sequence: 0,
                             timestamp_ns: now_ns(),
+                            direction: 0,
                             event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
                                 message: Some(pg_message_event::Message::Startup(startup)),
                             })),
-                            sequence: self.sequence,
-                            connection_id: self.connection_id.clone(),
-                            ..Default::default()
+                            metadata: Default::default(),
                         });
-                        self.sequence += 1;
                         self.state = PgState::Normal;
+
+                        // SYNTHETIC RESPONSE
+                        if self.is_replay {
+                            reply = Some(Self::synthesize_startup_response());
+                        }
                     } else {
                         let len = (&self.client_buf[0..4]).get_u32() as usize;
                         if self.client_buf.len() + 4 < len {
@@ -200,10 +276,45 @@ impl ConnectionParser for PostgresConnectionParser {
 
                     let message = match tag {
                         b'Q' => {
-                            // Query
                             let query = read_null_term_string(&mut body);
-                            // Wait, read_null_term_string takes &mut BytesMut. body is Bytes (from slice off check? No BytesMut::split_to returns BytesMut).
-                            // Ah, `slice` returns `BytesMut` if `frame` is `BytesMut`. Yes.
+
+                            // Check for SELECT 1 health check in Replay Mode
+                            if self.is_replay
+                                && (query.trim().eq_ignore_ascii_case("SELECT 1")
+                                    || query.trim().eq_ignore_ascii_case("SELECT 1;"))
+                            {
+                                let mut buf = BytesMut::new();
+
+                                // RowDescription
+                                let fields = vec![crate::events::PgColumn {
+                                    name: "?column?".to_string(),
+                                    table_oid: 0,
+                                    type_oid: 23, // int4/integer
+                                }];
+                                let row_desc = crate::events::PgRowDescription { fields };
+                                buf.extend_from_slice(&PgSerializer::serialize_row_desc(&row_desc));
+
+                                // DataRow
+                                let values = vec![b"1".to_vec()];
+                                let row = crate::events::PgDataRow { values };
+                                buf.extend_from_slice(&PgSerializer::serialize_data_row(&row));
+
+                                // CommandComplete
+                                let cc = crate::events::PgCommandComplete {
+                                    tag: "SELECT 1".to_string(),
+                                };
+                                buf.extend_from_slice(&PgSerializer::serialize_command_complete(
+                                    &cc,
+                                ));
+
+                                // ReadyForQuery
+                                buf.extend_from_slice(&PgSerializer::serialize_ready_for_query(
+                                    "I",
+                                ));
+
+                                reply = Some(buf.freeze());
+                            }
+
                             Some(pg_message_event::Message::Query(PgQuery { query }))
                         }
                         b'P' => {
@@ -247,27 +358,38 @@ impl ConnectionParser for PostgresConnectionParser {
 
                     if let Some(msg) = message {
                         events.push(RecordedEvent {
-                            trace_id: uuid::Uuid::new_v4().to_string(),
-                            span_id: uuid::Uuid::new_v4().to_string(),
+                            trace_id: String::new(),
+                            scope_id: String::new(),
+                            scope_sequence: 0,
+                            global_sequence: 0,
                             timestamp_ns: now_ns(),
+                            direction: 0,
                             event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
                                 message: Some(msg),
                             })),
-                            sequence: self.sequence,
-                            connection_id: self.connection_id.clone(),
-                            ..Default::default()
+                            metadata: Default::default(),
                         });
-                        self.sequence += 1;
                     }
                 }
             }
         }
 
+        // If we synthesized a reply, we shouldn't forward the data if there is no upstream
+        // However, in mock mode, there IS no upstream.
+        // In full protocol simulation, we rely on the Replay Engine matching events.
+        // BUT, the Startup Packet is technically "matched" by our synthetic response logic here.
+        // So we should NOT include the data in `forward` if we synthesized a response.
+        let forward = if reply.is_some() {
+            Bytes::new()
+        } else {
+            Bytes::copy_from_slice(data)
+        };
+
         Ok(ParseResult {
             events,
-            forward: Bytes::copy_from_slice(data),
+            forward,
             needs_more: false,
-            reply: None,
+            reply,
         })
     }
 
@@ -285,17 +407,17 @@ impl ConnectionParser for PostgresConnectionParser {
                 Ok(Some(msg)) => {
                     if let Some(event_msg) = map_backend_message(msg) {
                         events.push(RecordedEvent {
-                            trace_id: uuid::Uuid::new_v4().to_string(),
-                            span_id: uuid::Uuid::new_v4().to_string(),
+                            trace_id: String::new(),
+                            scope_id: String::new(),
+                            scope_sequence: 0,
+                            global_sequence: 0,
                             timestamp_ns: now_ns(),
+                            direction: 0,
                             event: Some(recorded_event::Event::PgMessage(PgMessageEvent {
                                 message: Some(event_msg),
                             })),
-                            sequence: self.sequence,
-                            connection_id: self.connection_id.clone(),
-                            ..Default::default()
+                            metadata: Default::default(),
                         });
-                        self.sequence += 1;
                     }
                 }
                 Ok(None) => break,
@@ -322,10 +444,11 @@ impl ConnectionParser for PostgresConnectionParser {
         self.client_buf.clear();
         self.server_buf.clear();
         self.state = PgState::Startup;
-        self.sequence = 0;
     }
 
-    fn set_mode(&mut self, _is_replay: bool) {}
+    fn set_mode(&mut self, is_replay: bool) {
+        self.is_replay = is_replay;
+    }
 }
 
 // Map only backend messages as we manually parse frontend
