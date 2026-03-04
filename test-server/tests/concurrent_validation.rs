@@ -65,7 +65,7 @@ fn spawn_err_relay(mut reader: BufReader<std::process::ChildStderr>, prefix: Str
 struct ConcurrentValidationContext {
     proxy_proc: Option<Child>,
     server_proc: Option<Child>,
-    
+
     grpc_proxy_port: u16,
     http_proxy_port: u16,
     grpc_server_port: u16,
@@ -75,7 +75,7 @@ struct ConcurrentValidationContext {
     pg_proxy_port: u16,
     mock_port: u16,
     control_port: u16,
-    
+
     recordings_dir: std::path::PathBuf,
     jsonl_path: std::path::PathBuf,
 }
@@ -84,7 +84,7 @@ impl ConcurrentValidationContext {
     async fn setup() -> Self {
         let recordings_dir_path = std::path::PathBuf::from("test_recordings_concurrent_validation");
         let jsonl_path = std::path::PathBuf::from("test_output_concurrent.jsonl");
-        
+
         if recordings_dir_path.exists() {
             let _ = std::fs::remove_dir_all(&recordings_dir_path);
         }
@@ -132,14 +132,17 @@ impl ConcurrentValidationContext {
 
     async fn start_proxy(&mut self, mode: &str) {
         let recordings_path = self.recordings_dir.to_str().unwrap();
-        
+
         let map_http = format!("{}:127.0.0.1:{}", self.http_proxy_port, self.mock_port);
         let map_redis = format!("{}:127.0.0.1:6379", self.redis_proxy_port);
         let map_pg = format!("{}:127.0.0.1:5432", self.pg_proxy_port);
-        
+
         let ingress = format!("{}:127.0.0.1:{}", self.grpc_proxy_port, self.connector_port);
-        
-        println!("Starting proxy in {} mode on port {}...", mode, self.grpc_proxy_port);
+
+        println!(
+            "Starting proxy in {} mode on port {}...",
+            mode, self.grpc_proxy_port
+        );
         let mut child = Command::new(resolve_binary("deja-proxy"))
             .args([
                 "--mode",
@@ -176,23 +179,43 @@ impl ConcurrentValidationContext {
     }
 
     async fn start_unified_server(&mut self, mode: &str) {
-        println!("Starting unified test-server on HTTP:{}, gRPC:{}, Connector:{} in {} mode...",
-            self.http_server_port, self.grpc_server_port, self.connector_port, mode);
-        
+        println!(
+            "Starting unified test-server on HTTP:{}, gRPC:{}, Connector:{} in {} mode...",
+            self.http_server_port, self.grpc_server_port, self.connector_port, mode
+        );
+
         let mut child = Command::new(resolve_binary("test-server"))
             .args([
-                "--grpc-port", &self.grpc_server_port.to_string(),
-                "--connector-port", &self.connector_port.to_string(),
-                "--http-port", &self.http_server_port.to_string(),
-                "--mock-port", &self.mock_port.to_string(),
-                "--deja-control-url", &format!("http://127.0.0.1:{}", self.control_port),
-                "--recording-path", self.recordings_dir.to_str().unwrap(),
-                "--jsonl-path", self.jsonl_path.to_str().unwrap(),
-                "--pg-url", &format!("postgres://deja_user:password@127.0.0.1:{}/deja_test", self.pg_proxy_port),
-                "--redis-url", &format!("redis://127.0.0.1:{}", self.redis_proxy_port),
+                "--grpc-port",
+                &self.grpc_server_port.to_string(),
+                "--connector-port",
+                &self.connector_port.to_string(),
+                "--http-port",
+                &self.http_server_port.to_string(),
+                "--mock-port",
+                &self.mock_port.to_string(),
+                "--deja-control-url",
+                &format!("http://127.0.0.1:{}", self.control_port),
+                "--recording-path",
+                self.recordings_dir.to_str().unwrap(),
+                "--jsonl-path",
+                self.jsonl_path.to_str().unwrap(),
+                "--pg-url",
+                &format!(
+                    "postgres://deja_user:password@127.0.0.1:{}/deja_test",
+                    self.pg_proxy_port
+                ),
+                "--redis-url",
+                &format!("redis://127.0.0.1:{}", self.redis_proxy_port),
             ])
-            .env("DEJA_CONTROL_URL", format!("http://127.0.0.1:{}", self.control_port))
-            .env("DEJA_PROXY_URL", format!("http://127.0.0.1:{}", self.control_port))
+            .env(
+                "DEJA_CONTROL_URL",
+                format!("http://127.0.0.1:{}", self.control_port),
+            )
+            .env(
+                "DEJA_PROXY_URL",
+                format!("http://127.0.0.1:{}", self.control_port),
+            )
             .env("DEJA_MODE", mode)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -205,15 +228,17 @@ impl ConcurrentValidationContext {
         spawn_err_relay(BufReader::new(stderr), "[SERVER]".to_string());
 
         self.server_proc = Some(child);
-        
+
         // Wait for all servers to start
         let grpc_started = self.wait_for_port(self.grpc_server_port).await;
         let http_started = self.wait_for_port(self.http_server_port).await;
         let connector_started = self.wait_for_port(self.connector_port).await;
-        
+
         if !grpc_started || !http_started || !connector_started {
-            panic!("Servers did not start properly. gRPC:{}, HTTP:{}, Connector:{}", 
-                grpc_started, http_started, connector_started);
+            panic!(
+                "Servers did not start properly. gRPC:{}, HTTP:{}, Connector:{}",
+                grpc_started, http_started, connector_started
+            );
         }
     }
 
@@ -229,7 +254,7 @@ impl ConcurrentValidationContext {
 
     fn analyze_jsonl(&self) -> HashMap<String, TraceEvents> {
         let mut traces: HashMap<String, TraceEvents> = HashMap::new();
-        
+
         if self.jsonl_path.exists() {
             let content = std::fs::read_to_string(&self.jsonl_path).unwrap();
             for line in content.lines() {
@@ -241,7 +266,7 @@ impl ConcurrentValidationContext {
                 }
             }
         }
-        
+
         traces
     }
 
@@ -257,10 +282,7 @@ impl ConcurrentValidationContext {
                         let content = std::fs::read_to_string(&events_path).unwrap();
                         for line in content.lines() {
                             if let Some((trace_id, protocol)) = extract_trace_and_protocol(line) {
-                                traces
-                                    .entry(trace_id)
-                                    .or_default()
-                                    .add_event(&protocol);
+                                traces.entry(trace_id).or_default().add_event(&protocol);
                             }
                         }
                     }
@@ -398,12 +420,8 @@ fn load_correlation_events(recordings_dir: &std::path::Path) -> Vec<CorrelationE
                     .unwrap_or(0);
 
                 let metadata = v.get("metadata").and_then(|x| x.as_object());
-                let has_nd_kind = metadata
-                    .map(|m| m.contains_key("nd_kind"))
-                    .unwrap_or(false);
-                let has_nd_seq = metadata
-                    .map(|m| m.contains_key("nd_seq"))
-                    .unwrap_or(false);
+                let has_nd_kind = metadata.map(|m| m.contains_key("nd_kind")).unwrap_or(false);
+                let has_nd_seq = metadata.map(|m| m.contains_key("nd_seq")).unwrap_or(false);
 
                 let is_non_deterministic = line.contains("non_deterministic")
                     || line.contains("NonDeterministic")
@@ -425,7 +443,8 @@ fn load_correlation_events(recordings_dir: &std::path::Path) -> Vec<CorrelationE
 }
 
 fn trace_graph_fingerprint(events: &[CorrelationEvent]) -> String {
-    let mut scopes: std::collections::BTreeMap<String, Vec<u64>> = std::collections::BTreeMap::new();
+    let mut scopes: std::collections::BTreeMap<String, Vec<u64>> =
+        std::collections::BTreeMap::new();
     let mut nd_count = 0usize;
 
     for event in events {
@@ -464,42 +483,41 @@ async fn test_concurrent_http_grpc_validation() {
 
     // PHASE 2: Send concurrent requests via HTTP and gRPC
     println!("\nSending concurrent requests...");
-    
+
     let num_requests = 5;
     let mut http_handles = Vec::new();
 
     for i in 0..num_requests {
         let http_port = ctx.http_server_port;
         let trace_id = format!("http-trace-{}", i);
-        
+
         let handle = tokio::spawn(async move {
             let client = reqwest::Client::new();
             let url = format!("http://127.0.0.1:{}/api/process", http_port);
-            
+
             let body = serde_json::json!({
                 "id": trace_id,
                 "data": format!("http-test-data-{}", i)
             });
-            
+
             let response = client
                 .post(&url)
                 .header("x-trace-id", &trace_id)
                 .json(&body)
                 .send()
                 .await;
-            
+
             (format!("http-{}", i), response)
         });
         http_handles.push(handle);
     }
 
-    let channel = tonic::transport::Channel::from_shared(
-        format!("http://127.0.0.1:{}", ctx.grpc_proxy_port)
-    )
-    .unwrap()
-    .connect()
-    .await
-    .unwrap();
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", ctx.grpc_proxy_port))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
 
     let grpc_client = ConnectorClient::new(channel);
 
@@ -507,18 +525,18 @@ async fn test_concurrent_http_grpc_validation() {
     for i in 0..num_requests {
         let mut client = grpc_client.clone();
         let trace_id = format!("grpc-trace-{}", i);
-        
+
         let handle = tokio::spawn(async move {
             let mut request = Request::new(ProcessRequest {
                 id: trace_id.clone(),
                 data: format!("grpc-test-data-{}", i),
             });
-            
+
             request.metadata_mut().insert(
                 "x-trace-id",
                 tonic::metadata::MetadataValue::try_from(&trace_id).unwrap(),
             );
-            
+
             let response = client.process(request).await;
             (format!("grpc-{}", i), response)
         });
@@ -527,21 +545,19 @@ async fn test_concurrent_http_grpc_validation() {
 
     let mut success_count = 0;
     let mut fail_count = 0;
-    
+
     for (i, handle) in http_handles.into_iter().enumerate() {
         match handle.await {
-            Ok((label, result)) => {
-                match result {
-                    Ok(_) => {
-                        println!("  ✅ Request {} succeeded", label);
-                        success_count += 1;
-                    }
-                    Err(e) => {
-                        println!("  ❌ Request {} failed: {:?}", label, e);
-                        fail_count += 1;
-                    }
+            Ok((label, result)) => match result {
+                Ok(_) => {
+                    println!("  ✅ Request {} succeeded", label);
+                    success_count += 1;
                 }
-            }
+                Err(e) => {
+                    println!("  ❌ Request {} failed: {:?}", label, e);
+                    fail_count += 1;
+                }
+            },
             Err(e) => {
                 println!("  ❌ Handle {} panicked: {:?}", i, e);
                 fail_count += 1;
@@ -551,18 +567,16 @@ async fn test_concurrent_http_grpc_validation() {
 
     for (i, handle) in grpc_handles.into_iter().enumerate() {
         match handle.await {
-            Ok((label, result)) => {
-                match result {
-                    Ok(_) => {
-                        println!("  ✅ Request {} succeeded", label);
-                        success_count += 1;
-                    }
-                    Err(e) => {
-                        println!("  ❌ Request {} failed: {:?}", label, e);
-                        fail_count += 1;
-                    }
+            Ok((label, result)) => match result {
+                Ok(_) => {
+                    println!("  ✅ Request {} succeeded", label);
+                    success_count += 1;
                 }
-            }
+                Err(e) => {
+                    println!("  ❌ Request {} failed: {:?}", label, e);
+                    fail_count += 1;
+                }
+            },
             Err(e) => {
                 println!("  ❌ Handle {} panicked: {:?}", i, e);
                 fail_count += 1;
@@ -570,8 +584,11 @@ async fn test_concurrent_http_grpc_validation() {
         }
     }
 
-    println!("\nResults: {} succeeded, {} failed", success_count, fail_count);
-    
+    println!(
+        "\nResults: {} succeeded, {} failed",
+        success_count, fail_count
+    );
+
     // Allow recording to flush
     sleep(Duration::from_secs(2)).await;
     ctx.stop_all().await;
@@ -582,16 +599,22 @@ async fn test_concurrent_http_grpc_validation() {
     println!("{}", "=".repeat(80));
 
     let traces = ctx.analyze_recordings();
-    
+
     println!("\nFound {} unique traces:", traces.len());
     for (trace_id, events) in &traces {
-        println!("  {}: {} events (HTTP={}, Redis={}, Postgres={})", 
-            trace_id, events.total_events, events.http_count, events.redis_count, events.postgres_count);
+        println!(
+            "  {}: {} events (HTTP={}, Redis={}, Postgres={})",
+            trace_id,
+            events.total_events,
+            events.http_count,
+            events.redis_count,
+            events.postgres_count
+        );
     }
 
     // Validate: each trace should have events
     assert!(!traces.is_empty(), "No traces found in recordings!");
-    
+
     // Check JSONL output exists in working dir
     if ctx.jsonl_path.exists() {
         println!("\n✅ JSONL output created: {:?}", ctx.jsonl_path);
@@ -638,7 +661,10 @@ async fn test_correlation_torture_record_invariants() {
         handles.push(tokio::spawn(async move {
             let client = reqwest::Client::new();
             client
-                .post(format!("http://127.0.0.1:{}/api/correlation/torture", http_port))
+                .post(format!(
+                    "http://127.0.0.1:{}/api/correlation/torture",
+                    http_port
+                ))
                 .json(&body)
                 .send()
                 .await
@@ -647,7 +673,10 @@ async fn test_correlation_torture_record_invariants() {
 
     for handle in handles {
         let response = handle.await.unwrap().expect("torture request failed");
-        assert!(response.status().is_success(), "torture endpoint returned non-2xx");
+        assert!(
+            response.status().is_success(),
+            "torture endpoint returned non-2xx"
+        );
     }
 
     sleep(Duration::from_secs(3)).await;
@@ -692,7 +721,8 @@ async fn test_correlation_torture_record_invariants() {
             );
         }
 
-        let mut by_scope: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+        let mut by_scope: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
         for event in &trace_events {
             by_scope
                 .entry(event.scope_id.clone())
@@ -707,12 +737,9 @@ async fn test_correlation_torture_record_invariants() {
 
             for (idx, seq) in sorted.iter().enumerate() {
                 assert_eq!(
-                    *seq,
-                    idx as u64,
+                    *seq, idx as u64,
                     "Non-contiguous scope_sequence for trace={}, scope={}, got={:?}",
-                    trace,
-                    scope,
-                    sorted
+                    trace, scope, sorted
                 );
             }
         }
@@ -735,8 +762,16 @@ async fn test_correlation_torture_record_invariants() {
                 trace,
                 event.scope_id
             );
-            assert!(event.has_nd_kind, "ND event missing metadata.nd_kind for {}", trace);
-            assert!(event.has_nd_seq, "ND event missing metadata.nd_seq for {}", trace);
+            assert!(
+                event.has_nd_kind,
+                "ND event missing metadata.nd_kind for {}",
+                trace
+            );
+            assert!(
+                event.has_nd_seq,
+                "ND event missing metadata.nd_seq for {}",
+                trace
+            );
         }
 
         let fingerprint = trace_graph_fingerprint(&trace_events);
@@ -786,14 +821,12 @@ async fn test_unified_concurrent_protocol_sdk_correlation() {
     ctx.start_proxy("record").await;
     ctx.start_unified_server("record").await;
 
-    let grpc_channel = tonic::transport::Channel::from_shared(format!(
-        "http://127.0.0.1:{}",
-        ctx.grpc_proxy_port
-    ))
-    .unwrap()
-    .connect()
-    .await
-    .unwrap();
+    let grpc_channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", ctx.grpc_proxy_port))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
     let grpc_client = ConnectorClient::new(grpc_channel);
 
     let grpc_count = 6usize;
@@ -860,7 +893,10 @@ async fn test_unified_concurrent_protocol_sdk_correlation() {
     }
     for task in http_tasks {
         let response = task.await.unwrap().expect("HTTP torture request failed");
-        assert!(response.status().is_success(), "HTTP request returned non-2xx");
+        assert!(
+            response.status().is_success(),
+            "HTTP request returned non-2xx"
+        );
     }
 
     sleep(Duration::from_secs(3)).await;
@@ -894,7 +930,9 @@ async fn test_unified_concurrent_protocol_sdk_correlation() {
             .cloned()
             .collect();
         assert!(
-            trace_events.iter().all(|event| !event.scope_id.contains("orphan")),
+            trace_events
+                .iter()
+                .all(|event| !event.scope_id.contains("orphan")),
             "gRPC trace {} contains orphan-scoped events",
             trace
         );
@@ -913,11 +951,12 @@ async fn test_unified_concurrent_protocol_sdk_correlation() {
         );
 
         assert!(
-            trace_events.iter().all(|event| !event.scope_id.contains("orphan")),
+            trace_events
+                .iter()
+                .all(|event| !event.scope_id.contains("orphan")),
             "HTTP trace {} contains orphan-scoped events",
             trace
         );
-
     }
 
     assert_eq!(
@@ -988,7 +1027,10 @@ async fn test_seeded_race_rapid_connection_churn() {
         handles.push(tokio::spawn(async move {
             let client = reqwest::Client::new();
             client
-                .post(format!("http://127.0.0.1:{}/api/correlation/torture", http_port))
+                .post(format!(
+                    "http://127.0.0.1:{}/api/correlation/torture",
+                    http_port
+                ))
                 .json(&body)
                 .send()
                 .await
@@ -1015,7 +1057,10 @@ async fn test_seeded_race_rapid_connection_churn() {
         }
     }
 
-    println!("\nResults: {} succeeded, {} failed", success_count, fail_count);
+    println!(
+        "\nResults: {} succeeded, {} failed",
+        success_count, fail_count
+    );
     assert_eq!(fail_count, 0, "All churn requests should succeed");
 
     sleep(Duration::from_secs(3)).await;
@@ -1024,7 +1069,7 @@ async fn test_seeded_race_rapid_connection_churn() {
     let all_events = load_correlation_events(&ctx.recordings_dir);
     assert!(!all_events.is_empty(), "No events found in recordings");
 
-    let mut events_by_trace: std::collections::HashMap<String, Vec<CorrelationEvent>> = 
+    let mut events_by_trace: std::collections::HashMap<String, Vec<CorrelationEvent>> =
         std::collections::HashMap::new();
     for event in &all_events {
         events_by_trace
@@ -1043,8 +1088,11 @@ async fn test_seeded_race_rapid_connection_churn() {
 
     fingerprints.sort_by(|a, b| a.0.cmp(&b.0));
 
-    println!("\nVerified {} churn traces with consistent fingerprints", fingerprints.len());
-    
+    println!(
+        "\nVerified {} churn traces with consistent fingerprints",
+        fingerprints.len()
+    );
+
     assert_eq!(
         fingerprints.len(),
         CONNECTION_COUNT,
@@ -1057,15 +1105,22 @@ async fn test_seeded_race_rapid_connection_churn() {
         .iter()
         .filter(|e| e.trace_id.starts_with("churn-seed-") && e.scope_id.contains("orphan"))
         .count();
-    assert_eq!(orphan_count, 0, "Churn test produced {} orphan-scoped events", orphan_count);
+    assert_eq!(
+        orphan_count, 0,
+        "Churn test produced {} orphan-scoped events",
+        orphan_count
+    );
 
     let aggregate_fp = fingerprints
         .iter()
         .map(|(_, fp)| fp.clone())
         .collect::<Vec<_>>()
         .join("||");
-    
-    println!("  Aggregate fingerprint length: {} chars", aggregate_fp.len());
+
+    println!(
+        "  Aggregate fingerprint length: {} chars",
+        aggregate_fp.len()
+    );
     assert!(
         aggregate_fp.contains("nd="),
         "Aggregate fingerprint should contain ND event counts"
@@ -1107,7 +1162,10 @@ async fn test_seeded_race_delayed_control_messages() {
     harness.delay_before_control(DELAY_MS);
     harness.reorder_with_seed(REORDER_SEED).unwrap();
 
-    println!("  Configuration: seed={}, delay={}ms", REORDER_SEED, DELAY_MS);
+    println!(
+        "  Configuration: seed={}, delay={}ms",
+        REORDER_SEED, DELAY_MS
+    );
 
     let trace_ids: Vec<String> = (0..TRACE_COUNT)
         .map(|i| format!("delay-seed-{}-trace-{:03}", REORDER_SEED, i))
@@ -1127,7 +1185,10 @@ async fn test_seeded_race_delayed_control_messages() {
             let client = reqwest::Client::new();
             let start = std::time::Instant::now();
             let result = client
-                .post(format!("http://127.0.0.1:{}/api/correlation/torture", http_port))
+                .post(format!(
+                    "http://127.0.0.1:{}/api/correlation/torture",
+                    http_port
+                ))
                 .json(&body)
                 .send()
                 .await;
@@ -1136,7 +1197,11 @@ async fn test_seeded_race_delayed_control_messages() {
         }));
     }
 
-    let mut results: Vec<(String, Result<reqwest::Response, reqwest::Error>, std::time::Duration)> = Vec::new();
+    let mut results: Vec<(
+        String,
+        Result<reqwest::Response, reqwest::Error>,
+        std::time::Duration,
+    )> = Vec::new();
     for handle in handles {
         let (trace_id, result, elapsed) = handle.await.unwrap();
         results.push((trace_id, result, elapsed));
@@ -1158,7 +1223,7 @@ async fn test_seeded_race_delayed_control_messages() {
     let all_events = load_correlation_events(&ctx.recordings_dir);
     assert!(!all_events.is_empty(), "No events found in recordings");
 
-    let mut events_by_trace: std::collections::HashMap<String, Vec<CorrelationEvent>> = 
+    let mut events_by_trace: std::collections::HashMap<String, Vec<CorrelationEvent>> =
         std::collections::HashMap::new();
     for event in &all_events {
         if event.trace_id.starts_with("delay-seed-") {
@@ -1170,7 +1235,8 @@ async fn test_seeded_race_delayed_control_messages() {
     }
 
     for (trace_id, events) in &events_by_trace {
-        let mut by_scope: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+        let mut by_scope: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
         for event in events {
             by_scope
                 .entry(event.scope_id.clone())
@@ -1222,10 +1288,16 @@ async fn test_seeded_race_delayed_control_messages() {
         .collect();
     trace_fingerprints.sort();
 
-    println!("  Verified {} traces with delayed control", trace_fingerprints.len());
+    println!(
+        "  Verified {} traces with delayed control",
+        trace_fingerprints.len()
+    );
     println!("  ND events captured: {}", nd_events.len());
 
-    println!("\nSEEDED RACE DELAY TEST PASSED (seed={}, delay={}ms)", REORDER_SEED, DELAY_MS);
+    println!(
+        "\nSEEDED RACE DELAY TEST PASSED (seed={}, delay={}ms)",
+        REORDER_SEED, DELAY_MS
+    );
 }
 
 /// Test combined stress: rapid churn + delay + reorder with fixed seed
@@ -1276,7 +1348,7 @@ async fn test_seeded_race_combined_stress_reproducible() {
     // Launch all connections concurrently (rapid churn)
     let start_time = std::time::Instant::now();
     let mut handles = Vec::with_capacity(CONNECTION_COUNT);
-    
+
     for (i, trace_id) in trace_ids.iter().enumerate() {
         let http_port = ctx.http_server_port;
         let trace_id = trace_id.clone();
@@ -1289,7 +1361,10 @@ async fn test_seeded_race_combined_stress_reproducible() {
         handles.push(tokio::spawn(async move {
             let client = reqwest::Client::new();
             client
-                .post(format!("http://127.0.0.1:{}/api/correlation/torture", http_port))
+                .post(format!(
+                    "http://127.0.0.1:{}/api/correlation/torture",
+                    http_port
+                ))
                 .json(&body)
                 .send()
                 .await
@@ -1314,7 +1389,10 @@ async fn test_seeded_race_combined_stress_reproducible() {
         CONNECTION_COUNT, success_count
     );
 
-    println!("  All {} connections launched in {:?}", CONNECTION_COUNT, launch_duration);
+    println!(
+        "  All {} connections launched in {:?}",
+        CONNECTION_COUNT, launch_duration
+    );
 
     // Allow recording to flush
     sleep(Duration::from_secs(3)).await;
@@ -1325,7 +1403,7 @@ async fn test_seeded_race_combined_stress_reproducible() {
     assert!(!all_events.is_empty(), "No events found in recordings");
 
     // Build trace graph
-    let mut events_by_trace: std::collections::HashMap<String, Vec<CorrelationEvent>> = 
+    let mut events_by_trace: std::collections::HashMap<String, Vec<CorrelationEvent>> =
         std::collections::HashMap::new();
     for event in &all_events {
         if event.trace_id.starts_with("stress-seed-") {
@@ -1354,7 +1432,7 @@ async fn test_seeded_race_combined_stress_reproducible() {
     for (trace_id, events) in &events_by_trace {
         total_events += events.len();
         total_nd_events += events.iter().filter(|e| e.is_non_deterministic).count();
-        
+
         let scopes: std::collections::HashSet<_> = events.iter().map(|e| &e.scope_id).collect();
         total_scopes += scopes.len();
 
@@ -1366,9 +1444,13 @@ async fn test_seeded_race_combined_stress_reproducible() {
         );
 
         // Collect max sequence numbers for deterministic verification
-        let mut by_scope: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+        let mut by_scope: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
         for event in events {
-            by_scope.entry(event.scope_id.clone()).or_default().push(event.scope_sequence);
+            by_scope
+                .entry(event.scope_id.clone())
+                .or_default()
+                .push(event.scope_sequence);
         }
         for seqs in by_scope.values() {
             if let Some(&max) = seqs.iter().max() {
@@ -1385,7 +1467,8 @@ async fn test_seeded_race_combined_stress_reproducible() {
     println!("  Total events: {}", total_events);
     println!("  Total ND events: {}", total_nd_events);
     println!("  Total unique scopes: {}", total_scopes);
-    println!("  Max sequence distribution: min={}, max={}, count={}",
+    println!(
+        "  Max sequence distribution: min={}, max={}, count={}",
         max_scope_sequences.first().unwrap_or(&0),
         max_scope_sequences.last().unwrap_or(&0),
         max_scope_sequences.len()
@@ -1422,15 +1505,12 @@ async fn test_seeded_race_combined_stress_reproducible() {
     // The key assertion: same seed must yield same ordering/attribution result
     // We verify this by checking structural invariants that would differ if
     // attribution were non-deterministic
-    let all_traces_have_consistent_scopes = events_by_trace
-        .values()
-        .all(|events| {
-            let trace_id = &events[0].trace_id;
-            events.iter().all(|e| {
-                e.scope_id.starts_with(&format!("trace:{}", trace_id)) ||
-                e.scope_id.contains(":task:")
-            })
-        });
+    let all_traces_have_consistent_scopes = events_by_trace.values().all(|events| {
+        let trace_id = &events[0].trace_id;
+        events.iter().all(|e| {
+            e.scope_id.starts_with(&format!("trace:{}", trace_id)) || e.scope_id.contains(":task:")
+        })
+    });
 
     assert!(
         all_traces_have_consistent_scopes,
@@ -1454,7 +1534,7 @@ async fn test_seeded_race_different_seeds_produce_different_orderings() {
     println!("{}", "=".repeat(80));
 
     let seeds = [1u64, 42u64, 12345u64, 99999u64, 1234567u64];
-    let mut fingerprints_by_seed: std::collections::HashMap<u64, String> = 
+    let mut fingerprints_by_seed: std::collections::HashMap<u64, String> =
         std::collections::HashMap::new();
 
     for seed in seeds {
@@ -1468,7 +1548,7 @@ async fn test_seeded_race_different_seeds_produce_different_orderings() {
 
         // Reorder with this seed
         let reordered = ControlEventHarness::reorder_messages(messages.clone(), seed);
-        
+
         // Create fingerprint of ordering
         let fingerprint: String = reordered
             .iter()
@@ -1490,12 +1570,11 @@ async fn test_seeded_race_different_seeds_produce_different_orderings() {
     }
 
     // Verify that we got different orderings for different seeds
-    let unique_orderings: std::collections::HashSet<_> = 
-        fingerprints_by_seed.values().collect();
-    
+    let unique_orderings: std::collections::HashSet<_> = fingerprints_by_seed.values().collect();
+
     println!("  Tested {} seeds", seeds.len());
     println!("  Unique orderings produced: {}", unique_orderings.len());
-    
+
     // We expect at least some variation - not all seeds should produce identical orderings
     // With 10 elements and Fisher-Yates, most seeds should produce different results
     assert!(

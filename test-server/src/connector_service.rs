@@ -3,11 +3,11 @@ use crate::connector::{ProcessRequest, ProcessResponse};
 use crate::db_pools::DatabasePools;
 use deja_sdk::{
     association::{associate_pg_connection, associate_redis_connection},
-    deja_run, generate_trace_id, get_runtime, reqwest::DejaClient, trace_context::current_trace_id,
-    ControlMessage, DejaAsyncBoundary, DejaRuntime,
+    deja_run, generate_trace_id, get_runtime,
+    reqwest::DejaClient,
+    trace_context::current_trace_id,
+    ControlMessage, DejaRuntime,
 };
-
-
 
 use sqlx::Connection;
 use std::sync::Arc;
@@ -46,7 +46,9 @@ impl Connector for ConnectorService {
         info!(trace_id = %trace_id, request_id = %req.id, "Processing gRPC request");
 
         deja_sdk::with_trace_id(trace_id.clone(), async move {
-            let generated_uuid = deja_run(&*runtime, "uuid", || Uuid::new_v4()).await.to_string();
+            let generated_uuid = deja_run(&*runtime, "uuid", || Uuid::new_v4())
+                .await
+                .to_string();
             let timestamp_ms = deja_run(&*runtime, "time", || {
                 SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -84,7 +86,8 @@ impl Connector for ConnectorService {
                     let _ = deja_sdk::with_trace_id(tid.clone(), async move {
                         let _bg_uuid = deja_run(&*rt_clone, "bg_uuid", || Uuid::new_v4()).await;
                         info!(trace_id = %tid, "Generated background UUID: {}", _bg_uuid);
-                    }).await;
+                    })
+                    .await;
                 }
             });
 

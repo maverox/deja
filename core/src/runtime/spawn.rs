@@ -169,7 +169,10 @@ mod tests {
 
         let result = trace_context::with_trace_id(parent_trace_id.clone(), async {
             // Verify parent has trace_id
-            assert_eq!(trace_context::current_trace_id(), Some(parent_trace_id.clone()));
+            assert_eq!(
+                trace_context::current_trace_id(),
+                Some(parent_trace_id.clone())
+            );
 
             // Spawn child task
             let handle = spawn(async {
@@ -240,9 +243,7 @@ mod tests {
                 );
 
                 // Spawn level 2 from within level 1
-                let handle2 = spawn(async {
-                    trace_context::current_trace_id()
-                });
+                let handle2 = spawn(async { trace_context::current_trace_id() });
 
                 handle2.await.unwrap()
             });

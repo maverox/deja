@@ -67,11 +67,7 @@ impl RecordingStore for LocalFileStore {
         Ok(())
     }
 
-    async fn save_batch(
-        &self,
-        session_id: &str,
-        events: Vec<Vec<u8>>,
-    ) -> Result<(), StorageError> {
+    async fn save_batch(&self, session_id: &str, events: Vec<Vec<u8>>) -> Result<(), StorageError> {
         self.ensure_session_dir(session_id).await?;
         let mut file = fs::OpenOptions::new()
             .create(true)

@@ -3,5 +3,4 @@
 pub mod harness;
 pub mod mocks;
 
-// Re-export the harness
-pub use harness::*;
+// Re-export the harness (used by integration tests)

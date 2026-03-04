@@ -82,10 +82,7 @@ async fn run_empty_session(store: &dyn RecordingStore) {
         .load_events("nonexistent-session-xyz")
         .await
         .expect("load_events on missing session should return Ok");
-    assert!(
-        loaded.is_empty(),
-        "missing session should return empty vec"
-    );
+    assert!(loaded.is_empty(), "missing session should return empty vec");
 }
 
 async fn run_index_save_and_load(store: &dyn IndexStore) {

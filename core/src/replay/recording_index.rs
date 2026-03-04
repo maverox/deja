@@ -315,7 +315,12 @@ mod tests {
         }
     }
 
-    fn create_http_response(trace_id: &str, scope_id: &str, status: u32, seq: u64) -> RecordedEvent {
+    fn create_http_response(
+        trace_id: &str,
+        scope_id: &str,
+        status: u32,
+        seq: u64,
+    ) -> RecordedEvent {
         RecordedEvent {
             trace_id: trace_id.to_string(),
             scope_id: scope_id.to_string(),

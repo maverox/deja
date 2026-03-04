@@ -164,11 +164,8 @@ async fn resolve_association(
     match correlator.on_new_connection(peer_port, protocol).await {
         Ok(assoc) => Some(assoc),
         Err(rx) => {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(association_timeout_ms),
-                rx,
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(association_timeout_ms), rx)
+                .await
             {
                 Ok(Ok(assoc)) => Some(assoc),
                 Ok(Err(_)) => {
@@ -203,7 +200,8 @@ async fn resolve_association(
 }
 
 /// Process client events: enrich, record, and replay-match
-/// In record mode with unresolved (orphan) association, buffers events for retro-binding.
+/// In record mode with unresolved (orphan) association, buffers events for retro-binding
+/// until the retro-bind window elapses; after that, events fall through and are recorded as orphan.
 async fn process_client_events(
     events: Vec<RecordedEvent>,
     association: &Arc<tokio::sync::Mutex<RuntimeAssociation>>,
@@ -215,21 +213,29 @@ async fn process_client_events(
     peer_port: u16,
     retro_bind_window_ms: u64,
     is_replay_strict: bool,
+    connection_start: tokio::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_record_mode = recorder.is_some() && replay_engine.is_none();
 
     for mut event in events {
         let assoc = association.lock().await.clone();
 
-        // In record mode with orphan association, buffer events for retro-binding
-        if is_record_mode && assoc.trace_id == "orphan" && retro_bind_window_ms > 0 {
-            correlator.buffer_event_for_retro_bind(
-                peer_port,
-                retro_bind_window_ms,
-                event,
-                EventDirection::ClientToServer,
-            ).await;
-            continue;
+        // In record mode with orphan association, buffer a copy for potential retro-binding
+        // while the window is still open, but always fall through to record as orphan.
+        // This ensures events are never silently lost if the proxy is killed.
+        if is_record_mode
+            && assoc.trace_id == "orphan"
+            && retro_bind_window_ms > 0
+            && connection_start.elapsed() < std::time::Duration::from_millis(retro_bind_window_ms)
+        {
+            correlator
+                .buffer_event_for_retro_bind(
+                    peer_port,
+                    retro_bind_window_ms,
+                    event.clone(),
+                    EventDirection::ClientToServer,
+                )
+                .await;
         }
 
         let stream_id = extract_stream_id(&event);
@@ -284,19 +290,18 @@ async fn process_client_events(
                     }
                 }
                 Ok(None) => {
-                    // In strict (fail-closed) mode, reject unresolved attribution with error
-                    // In lenient (fail-open) mode, skip error and forward without response
-                    if is_replay_strict && !event.trace_id.is_empty() && event.trace_id != "orphan" {
-                        let error_bytes = make_protocol_error(protocol_id, None);
-                        if !error_bytes.is_empty() {
-                            let mut cw = c_write.lock().await;
-                            let _ = cw.write_all(&error_bytes).await;
-                        }
+                    // No recorded response matched this event.
+                    // Always send a protocol-appropriate error to prevent the client
+                    // from hanging indefinitely waiting for a response that will never come.
+                    let error_bytes = make_protocol_error(protocol_id, None);
+                    if !error_bytes.is_empty() {
+                        let mut cw = c_write.lock().await;
+                        let _ = cw.write_all(&error_bytes).await;
                     }
                 }
                 Err(err) => {
-                    // In strict (fail-closed) mode, send typed errors
-                    // In lenient (fail-open) mode, skip error forwarding
+                    // Always send a typed error response to prevent client hangs.
+                    // In strict mode, log a warning; in lenient mode, silently respond.
                     if is_replay_strict {
                         warn!(
                             trace_id = %event.trace_id,
@@ -304,11 +309,11 @@ async fn process_client_events(
                             code = err.code(),
                             "Typed replay attribution error"
                         );
-                        let error_bytes = make_protocol_error(protocol_id, Some(&err));
-                        if !error_bytes.is_empty() {
-                            let mut cw = c_write.lock().await;
-                            let _ = cw.write_all(&error_bytes).await;
-                        }
+                    }
+                    let error_bytes = make_protocol_error(protocol_id, Some(&err));
+                    if !error_bytes.is_empty() {
+                        let mut cw = c_write.lock().await;
+                        let _ = cw.write_all(&error_bytes).await;
                     }
                 }
             }
@@ -377,15 +382,15 @@ fn make_protocol_error(protocol_id: &str, replay_error: Option<&ReplayMatchError
         let message = ReplayMatchError::UNRESOLVED_ATTRIBUTION_MESSAGE;
         return match protocol_id {
             "redis" => format!("-ERR {}\r\n", message).into_bytes(),
-            "http" => {
-                format!(
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{}",
-                    message.len(),
-                    message
-                )
-                .into_bytes()
+            "http" => format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{}",
+                message.len(),
+                message
+            )
+            .into_bytes(),
+            "postgres" => {
+                deja_core::protocols::postgres::PgSerializer::serialize_error(message).to_vec()
             }
-            "postgres" => deja_core::protocols::postgres::PgSerializer::serialize_error(message).to_vec(),
             "grpc" => {
                 use deja_core::events::GrpcStatusCode;
                 deja_core::protocols::grpc::GrpcSerializer::serialize_error(
@@ -436,8 +441,8 @@ mod tests {
             global_sequence: 0,
             timestamp_ns: 0,
             direction: EventDirection::ClientToServer as i32,
-            event: Some(
-                deja_core::events::recorded_event::Event::GrpcRequest(GrpcRequestEvent {
+            event: Some(deja_core::events::recorded_event::Event::GrpcRequest(
+                GrpcRequestEvent {
                     service: service.to_string(),
                     method: method.to_string(),
                     request_body: vec![],
@@ -445,8 +450,8 @@ mod tests {
                     call_type: deja_core::events::GrpcCallType::Unary.into(),
                     stream_id,
                     authority: "localhost".to_string(),
-                }),
-            ),
+                },
+            )),
             metadata: std::collections::HashMap::new(),
         }
     }
@@ -460,8 +465,8 @@ mod tests {
             global_sequence: 0,
             timestamp_ns: 0,
             direction: EventDirection::ServerToClient as i32,
-            event: Some(
-                deja_core::events::recorded_event::Event::GrpcResponse(GrpcResponseEvent {
+            event: Some(deja_core::events::recorded_event::Event::GrpcResponse(
+                GrpcResponseEvent {
                     response_body: vec![],
                     status_code,
                     status_message: String::new(),
@@ -469,8 +474,8 @@ mod tests {
                     trailers: std::collections::HashMap::new(),
                     latency_ms: 10,
                     stream_id,
-                }),
-            ),
+                },
+            )),
             metadata: std::collections::HashMap::new(),
         }
     }
@@ -687,18 +692,16 @@ mod tests {
             global_sequence: 0,
             timestamp_ns: 0,
             direction: 0,
-            event: Some(
-                deja_core::events::recorded_event::Event::HttpRequest(
-                    deja_core::events::HttpRequestEvent {
-                        method: "GET".to_string(),
-                        path: "/test".to_string(),
-                        headers: Default::default(),
-                        body: vec![],
-                        schema: "http".to_string(),
-                        host: "localhost".to_string(),
-                    },
-                ),
-            ),
+            event: Some(deja_core::events::recorded_event::Event::HttpRequest(
+                deja_core::events::HttpRequestEvent {
+                    method: "GET".to_string(),
+                    path: "/test".to_string(),
+                    headers: Default::default(),
+                    body: vec![],
+                    schema: "http".to_string(),
+                    host: "localhost".to_string(),
+                },
+            )),
             metadata: Default::default(),
         };
 
@@ -855,10 +858,20 @@ mod tests {
         };
 
         correlator
-            .buffer_event_for_retro_bind(source_port, window_ms, event1.clone(), EventDirection::ClientToServer)
+            .buffer_event_for_retro_bind(
+                source_port,
+                window_ms,
+                event1.clone(),
+                EventDirection::ClientToServer,
+            )
             .await;
         correlator
-            .buffer_event_for_retro_bind(source_port, window_ms, event2.clone(), EventDirection::ServerToClient)
+            .buffer_event_for_retro_bind(
+                source_port,
+                window_ms,
+                event2.clone(),
+                EventDirection::ServerToClient,
+            )
             .await;
 
         assert_eq!(
@@ -878,9 +891,19 @@ mod tests {
 
         // Then: Buffered events are flushed and attributed
         assert_eq!(flushed.len(), 2, "Both events should be flushed");
-        assert_eq!(flushed[0].0.trace_id, "t1", "First event should be attributed to t1");
-        assert_eq!(flushed[0].0.scope_id, scope_id.as_str(), "First event should have correct scope");
-        assert_eq!(flushed[1].0.trace_id, "t1", "Second event should be attributed to t1");
+        assert_eq!(
+            flushed[0].0.trace_id, "t1",
+            "First event should be attributed to t1"
+        );
+        assert_eq!(
+            flushed[0].0.scope_id,
+            scope_id.as_str(),
+            "First event should have correct scope"
+        );
+        assert_eq!(
+            flushed[1].0.trace_id, "t1",
+            "Second event should be attributed to t1"
+        );
 
         // Buffer should be empty after flush
         assert_eq!(
@@ -893,7 +916,11 @@ mod tests {
         );
 
         // Quarantine should be empty
-        assert_eq!(correlator.quarantined_count().await, 0, "No events should be quarantined");
+        assert_eq!(
+            correlator.quarantined_count().await,
+            0,
+            "No events should be quarantined"
+        );
     }
 
     #[tokio::test]
@@ -919,7 +946,12 @@ mod tests {
         };
 
         correlator
-            .buffer_event_for_retro_bind(source_port, window_ms, event1, EventDirection::ClientToServer)
+            .buffer_event_for_retro_bind(
+                source_port,
+                window_ms,
+                event1,
+                EventDirection::ClientToServer,
+            )
             .await;
 
         // When: Flush is attempted (all events are expired due to 0ms window)
@@ -929,7 +961,11 @@ mod tests {
             .await;
 
         // Then: No events within window - all expired
-        assert_eq!(flushed.len(), 0, "No events should be flushed (all expired)");
+        assert_eq!(
+            flushed.len(),
+            0,
+            "No events should be flushed (all expired)"
+        );
 
         // When: Quarantine the expired events
         let expired = correlator.quarantine_expired_events(source_port).await;
@@ -943,12 +979,17 @@ mod tests {
         );
     }
 
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     #[tokio::test]
     async fn replay_strict_mode_defaults_to_lenient() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Given: No environment variable or explicit config (defaults to "lenient")
         // IMPORTANT: Clear env var first to avoid pollution from parallel tests
         std::env::remove_var("DEJA_REPLAY_STRICT");
-        
+
         let replay_strict_mode = "lenient".to_string();
 
         // When: Determining replay strictness
@@ -964,6 +1005,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_strict_mode_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let replay_strict_mode = "lenient".to_string();
 
         std::env::set_var("DEJA_REPLAY_STRICT", "strict");
@@ -981,6 +1023,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_strict_mode_config_explicit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DEJA_REPLAY_STRICT");
         // Given: Config explicitly set to "strict"
         let replay_strict_mode = "strict".to_string();
 
@@ -996,6 +1040,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_lenient_mode_config_explicit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DEJA_REPLAY_STRICT");
         // Given: Config explicitly set to "lenient"
         let replay_strict_mode = "lenient".to_string();
 
@@ -1010,6 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_strict_mode_case_insensitive_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Given: Multiple case variations of strict mode
         for value in ["strict", "STRICT", "Strict"] {
             std::env::set_var("DEJA_REPLAY_STRICT", value);
@@ -1030,6 +1077,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_lenient_mode_case_insensitive_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Given: Multiple case variations of lenient mode
         for value in ["lenient", "LENIENT", "Lenient"] {
             std::env::set_var("DEJA_REPLAY_STRICT", value);
@@ -1072,9 +1120,9 @@ pub async fn handle_tls_connection(
 
     let (mut c_read, c_write) = tokio::io::split(tls_client_stream);
 
-    // In replay mode or when replay strict mode is enabled, don't connect to real target
+    // In replay mode, never connect to real target — serve from recordings only
     let is_replay_mode = replay_engine.is_some();
-    let target_stream = if !is_replay_mode || is_replay_strict {
+    let target_stream = if !is_replay_mode {
         let target_tcp = TcpStream::connect(&target_addr).await?;
         // Register outgoing port mapping for correlation
         // The SDK queries the database server for client port, which returns our outgoing port,
@@ -1082,7 +1130,9 @@ pub async fn handle_tls_connection(
         if let Ok(local_addr) = target_tcp.local_addr() {
             let outgoing_port = local_addr.port();
             let peer_port = peer_addr.port();
-            correlator.register_outgoing_port_mapping(outgoing_port, peer_port).await;
+            correlator
+                .register_outgoing_port_mapping(outgoing_port, peer_port)
+                .await;
         }
         let client_config = tls_manager.client_config();
         let connector = tokio_rustls::TlsConnector::from(client_config);
@@ -1117,8 +1167,15 @@ pub async fn handle_tls_connection(
         .and_then(|s| s.parse().ok())
         .unwrap_or(500);
     let peer_port = peer_addr.port();
-    let assoc =
-        resolve_association(&correlator, peer_port, protocol, association_timeout_ms, retro_bind_window_ms, is_record_mode).await;
+    let assoc = resolve_association(
+        &correlator,
+        peer_port,
+        protocol,
+        association_timeout_ms,
+        retro_bind_window_ms,
+        is_record_mode,
+    )
+    .await;
     let (scope_id, trace_id) = match &assoc {
         Some(a) => (a.scope_id.clone(), a.trace_id.clone()),
         None => {
@@ -1135,6 +1192,7 @@ pub async fn handle_tls_connection(
     }));
 
     let c_write = Arc::new(tokio::sync::Mutex::new(c_write));
+    let connection_start = tokio::time::Instant::now();
 
     let (t_read, t_write) = if let Some(ts) = target_stream {
         let (tr, tw) = tokio::io::split(ts);
@@ -1173,6 +1231,7 @@ pub async fn handle_tls_connection(
                     peer_port,
                     retro_bind_window_ms,
                     is_replay_strict,
+                    connection_start,
                 )
                 .await?;
 
@@ -1182,9 +1241,14 @@ pub async fn handle_tls_connection(
                         tw.write_all(&res.forward).await?;
                     }
                 }
-                if let Some(reply) = res.reply {
-                    let mut cw = c_write.lock().await;
-                    cw.write_all(&reply).await?;
+                // In replay mode, the replay engine provides all responses.
+                // Skip parser-synthesized replies to prevent double-sends
+                // (e.g., PG Auth+Ready and Redis PONG).
+                if replay_engine.is_none() {
+                    if let Some(reply) = res.reply {
+                        let mut cw = c_write.lock().await;
+                        cw.write_all(&reply).await?;
+                    }
                 }
             }
             Err(_) => {
@@ -1233,9 +1297,13 @@ pub async fn handle_tls_connection(
                         peer_port_c,
                         retro_window_c,
                         is_replay_strict,
+                        connection_start,
                     )
                     .await
-                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
+                    .map_err(|e| {
+                        Box::new(std::io::Error::other(e.to_string()))
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?;
 
                     if let Some(tw) = &t_write_c {
                         if !res.forward.is_empty() {
@@ -1245,19 +1313,31 @@ pub async fn handle_tls_connection(
                             })?;
                         }
                     }
-                    if let Some(reply) = res.reply {
-                        let mut cw = c_write_c.lock().await;
-                        cw.write_all(&reply).await.map_err(|e| {
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        })?;
+                    // In replay mode, the replay engine provides all responses.
+                    // Skip parser-synthesized replies to prevent double-sends.
+                    if rep_c.is_none() {
+                        if let Some(reply) = res.reply {
+                            let mut cw = c_write_c.lock().await;
+                            cw.write_all(&reply).await.map_err(|e| {
+                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                            })?;
+                        }
                     }
                 }
                 Err(_) => {
                     if let Some(tw) = &t_write_c {
                         let mut tw = tw.lock().await;
-                        tw.write_all(&buf[..n]).await.map_err(|e| {
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        })?;
+                        tw.write_all(&buf[..n])
+                            .await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    } else if rep_c.is_some() {
+                        // In replay mode with no target, send a protocol error
+                        // to prevent the client from hanging indefinitely.
+                        let error_bytes = make_protocol_error(&proto_c, None);
+                        if !error_bytes.is_empty() {
+                            let mut cw = c_write_c.lock().await;
+                            let _ = cw.write_all(&error_bytes).await;
+                        }
                     }
                 }
             }
@@ -1272,6 +1352,9 @@ pub async fn handle_tls_connection(
     // Target -> Client handler
     let c_write_t = c_write.clone();
     let parser_t = parser_lock.clone();
+    let corr_t = correlator.clone();
+    let rec_t = recorder.clone();
+    let assoc_t = association.clone();
 
     let t_handle = async move {
         if let Some(mut t_read) = t_read {
@@ -1288,8 +1371,7 @@ pub async fn handle_tls_connection(
                 let mut p = parser_t.lock().await;
                 match p.parse_server_data(&buf[..n]) {
                     Ok(res) => {
-                        process_server_events(res.events, &association, &correlator, &recorder)
-                            .await;
+                        process_server_events(res.events, &assoc_t, &corr_t, &rec_t).await;
 
                         if !res.forward.is_empty() {
                             let mut cw = c_write_t.lock().await;
@@ -1300,9 +1382,9 @@ pub async fn handle_tls_connection(
                     }
                     Err(_) => {
                         let mut cw = c_write_t.lock().await;
-                        cw.write_all(&buf[..n]).await.map_err(|e| {
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        })?;
+                        cw.write_all(&buf[..n])
+                            .await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     }
                 }
             }
@@ -1313,6 +1395,26 @@ pub async fn handle_tls_connection(
     };
 
     tokio::try_join!(c_handle, t_handle)?;
+
+    // Flush remaining buffered events as orphan after connection ends
+    if is_record_mode && retro_bind_window_ms > 0 {
+        let expired = correlator.quarantine_expired_events(peer_port).await;
+        if !expired.is_empty() {
+            if let Some(rec) = &recorder {
+                for (event, dir) in &expired {
+                    let mut event_clone = event.clone();
+                    let orphan_id =
+                        ORPHAN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let orphan_scope = ScopeId::orphan(orphan_id);
+                    enrich_event(&mut event_clone, &orphan_scope, "orphan", *dir, &correlator)
+                        .await;
+                    let _ = rec.save_event(&event_clone).await;
+                }
+            }
+            correlator.add_to_quarantine(peer_port, expired).await;
+        }
+    }
+
     Ok(())
 }
 
@@ -1333,7 +1435,7 @@ pub async fn handle_connection(
     is_replay_strict: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_replay_mode = replay_engine.is_some();
-    let target_stream = if !is_replay_mode || is_replay_strict {
+    let target_stream = if !is_replay_mode {
         Some(
             TcpStream::connect(&target_addr)
                 .await
@@ -1350,7 +1452,9 @@ pub async fn handle_connection(
         if let Ok(local_addr) = ts.local_addr() {
             let outgoing_port = local_addr.port();
             let peer_port = peer_addr.port();
-            correlator.register_outgoing_port_mapping(outgoing_port, peer_port).await;
+            correlator
+                .register_outgoing_port_mapping(outgoing_port, peer_port)
+                .await;
         }
     }
 
@@ -1362,8 +1466,15 @@ pub async fn handle_connection(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(500);
-    let assoc =
-        resolve_association(&correlator, peer_addr.port(), protocol, association_timeout_ms, retro_bind_window_ms, is_record_mode).await;
+    let assoc = resolve_association(
+        &correlator,
+        peer_addr.port(),
+        protocol,
+        association_timeout_ms,
+        retro_bind_window_ms,
+        is_record_mode,
+    )
+    .await;
     let (scope_id, trace_id) = match assoc {
         Some(a) => (a.scope_id, a.trace_id),
         None => {
@@ -1374,7 +1485,8 @@ pub async fn handle_connection(
                     let sid = correlator.allocate_connection_id(tid).await;
                     (sid, tid.clone())
                 } else {
-                    let orphan_id = ORPHAN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let orphan_id =
+                        ORPHAN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     (ScopeId::orphan(orphan_id), "orphan".to_string())
                 }
             } else {
@@ -1393,6 +1505,7 @@ pub async fn handle_connection(
 
     let (mut c_read, c_write) = client_stream.into_split();
     let c_write = Arc::new(tokio::sync::Mutex::new(c_write));
+    let connection_start = tokio::time::Instant::now();
 
     let (t_read, t_write) = if let Some(ts) = target_stream {
         let (tr, tw) = ts.into_split();
@@ -1451,10 +1564,14 @@ pub async fn handle_connection(
                         &c_write_c,
                         peer_port_c,
                         retro_window_c,
-                        false,  // lenient from handle_connection
+                        is_replay_strict,
+                        connection_start,
                     )
                     .await
-                    .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
+                    .map_err(|e| {
+                        Box::new(std::io::Error::other(e.to_string()))
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?;
 
                     if let Some(tw) = &t_write_c {
                         if !res.forward.is_empty() {
@@ -1464,19 +1581,31 @@ pub async fn handle_connection(
                             })?;
                         }
                     }
-                    if let Some(reply) = res.reply {
-                        let mut cw = c_write_c.lock().await;
-                        cw.write_all(&reply).await.map_err(|e| {
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        })?;
+                    // In replay mode, the replay engine provides all responses.
+                    // Skip parser-synthesized replies to prevent double-sends.
+                    if rep_c.is_none() {
+                        if let Some(reply) = res.reply {
+                            let mut cw = c_write_c.lock().await;
+                            cw.write_all(&reply).await.map_err(|e| {
+                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                            })?;
+                        }
                     }
                 }
                 Err(_) => {
                     if let Some(tw) = &t_write_c {
                         let mut tw = tw.lock().await;
-                        tw.write_all(&buf[..n]).await.map_err(|e| {
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        })?;
+                        tw.write_all(&buf[..n])
+                            .await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    } else if rep_c.is_some() {
+                        // In replay mode with no target, send a protocol error
+                        // to prevent the client from hanging indefinitely.
+                        let error_bytes = make_protocol_error(&proto_c, None);
+                        if !error_bytes.is_empty() {
+                            let mut cw = c_write_c.lock().await;
+                            let _ = cw.write_all(&error_bytes).await;
+                        }
                     }
                 }
             }
@@ -1509,22 +1638,16 @@ pub async fn handle_connection(
 
                 let mut p = parser_t.lock().await;
                 if let Ok(res) = p.parse_server_data(&buf[..n]) {
-                    process_server_events(
-                        res.events,
-                        &assoc_t,
-                        &corr_t,
-                        &rec_t,
-                    )
-                    .await;
+                    process_server_events(res.events, &assoc_t, &corr_t, &rec_t).await;
                     let mut cw = c_write_t.lock().await;
-                    cw.write_all(&res.forward).await.map_err(|e| {
-                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                    })?;
+                    cw.write_all(&res.forward)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 } else {
                     let mut cw = c_write_t.lock().await;
-                    cw.write_all(&buf[..n]).await.map_err(|e| {
-                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                    })?;
+                    cw.write_all(&buf[..n])
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 }
             }
             let mut cw = c_write_t.lock().await;
@@ -1534,5 +1657,26 @@ pub async fn handle_connection(
     };
 
     tokio::try_join!(c_handle, t_handle)?;
+
+    // Flush remaining buffered events as orphan after connection ends
+    if is_record_mode && retro_bind_window_ms > 0 {
+        let peer_port = peer_addr.port();
+        let expired = correlator.quarantine_expired_events(peer_port).await;
+        if !expired.is_empty() {
+            if let Some(rec) = &recorder {
+                for (event, dir) in &expired {
+                    let mut event_clone = event.clone();
+                    let orphan_id =
+                        ORPHAN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let orphan_scope = ScopeId::orphan(orphan_id);
+                    enrich_event(&mut event_clone, &orphan_scope, "orphan", *dir, &correlator)
+                        .await;
+                    let _ = rec.save_event(&event_clone).await;
+                }
+            }
+            correlator.add_to_quarantine(peer_port, expired).await;
+        }
+    }
+
     Ok(())
 }

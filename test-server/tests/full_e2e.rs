@@ -34,8 +34,17 @@ async fn run_client_scenario(
     proxy_tcp_port: u16,
     sdk: &Runtime,
 ) -> (String, String, String, String) {
+    let trace_id = deja_sdk::current_trace_id().expect("must be called within with_trace_id");
+    let control = sdk.control_client();
+
+    // Notify the proxy that this trace has started — without this,
+    // the proxy cannot allocate connection scopes for the trace.
+    control
+        .send_best_effort(deja_sdk::ControlMessage::start_trace(trace_id.clone()))
+        .await;
+    sleep(Duration::from_millis(50)).await;
+
     // 1. Get UUID from SDK - use run() with user's own uuid generator
-    // SDK uses local trace context set by with_trace_id caller
     let uuid: uuid::Uuid = deja_sdk::deja_run(sdk, "uuid", || uuid::Uuid::new_v4()).await;
 
     // 2. Generic TCP (simulating MySQL or whatever)
@@ -58,10 +67,23 @@ async fn run_client_scenario(
             }
         };
 
+        // Associate BEFORE sending any data — the proxy must know the mapping
+        // before it processes the first bytes, otherwise they become orphan events.
+        let source_port = stream.local_addr().unwrap().port();
+        control
+            .send_best_effort(deja_sdk::ControlMessage::associate_by_source_port(
+                trace_id.clone(),
+                source_port,
+                deja_common::Protocol::Unknown,
+            ))
+            .await;
+        sleep(Duration::from_millis(50)).await;
+
         stream
             .write_all(b"\xDE\xAD\xBE\xEF")
             .await
             .expect("Failed to write to TCP port");
+
         let mut buf = [0u8; 1024];
         let n = stream
             .read(&mut buf)
@@ -93,6 +115,17 @@ async fn run_client_scenario(
             }
         };
 
+        // Associate BEFORE sending startup message
+        let source_port = stream.local_addr().unwrap().port();
+        control
+            .send_best_effort(deja_sdk::ControlMessage::associate_by_source_port(
+                trace_id.clone(),
+                source_port,
+                deja_common::Protocol::Postgres,
+            ))
+            .await;
+        sleep(Duration::from_millis(50)).await;
+
         // Startup: len=8, proto=3.0 (0,3,0,0)
         let startup = [0, 0, 0, 8, 0, 3, 0, 0];
         stream
@@ -107,10 +140,15 @@ async fn run_client_scenario(
             pg_resp_summary.push_str("AuthReady");
         }
 
-        // Send Query: 'Q' + "SELECT 1" + 0
-        let query = b"QSELECT 1\0";
+        // Send Query in proper PG wire format:
+        // 'Q' (tag) + int32 length (includes self) + query string + null terminator
+        // "SELECT 1\0" is 9 bytes, length = 4 + 9 = 13
+        let mut query = Vec::new();
+        query.push(b'Q');
+        query.extend_from_slice(&13u32.to_be_bytes()); // length = 4 (self) + 8 ("SELECT 1") + 1 (\0)
+        query.extend_from_slice(b"SELECT 1\0");
         stream
-            .write_all(query)
+            .write_all(&query)
             .await
             .expect("Failed to write PG query");
 
@@ -142,10 +180,23 @@ async fn run_client_scenario(
             }
         };
 
+        // Associate BEFORE sending PING
+        let source_port = stream.local_addr().unwrap().port();
+        control
+            .send_best_effort(deja_sdk::ControlMessage::associate_by_source_port(
+                trace_id.clone(),
+                source_port,
+                deja_common::Protocol::Redis,
+            ))
+            .await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Send PING in RESP array format: *1\r\n$4\r\nPING\r\n
         stream
-            .write_all(b"PING")
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
             .await
             .expect("Failed to write Redis PING");
+
         let mut buf = [0u8; 1024];
         let n = stream
             .read(&mut buf)
@@ -153,6 +204,11 @@ async fn run_client_scenario(
             .expect("Failed to read Redis response");
         redis_resp_str = String::from_utf8_lossy(&buf[..n]).trim().to_string();
     }
+
+    // Notify the proxy that this trace has ended
+    control
+        .send_best_effort(deja_sdk::ControlMessage::end_trace(trace_id))
+        .await;
 
     (
         uuid.to_string(),
@@ -205,6 +261,9 @@ async fn test_full_e2e_flow() {
         run_client_scenario(proxy_pg_port, proxy_redis_port, proxy_tcp_port, &sdk).await
     })
     .await;
+
+    // Flush captured deterministic values (UUIDs, etc.) to the proxy before shutdown
+    sdk.flush().await;
 
     println!("📥 Record Results: {:?}", results_record);
 

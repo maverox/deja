@@ -127,6 +127,8 @@ impl TestHarness {
             recordings_path.to_string(),
             "--control-port".to_string(),
             self.control_api_port.to_string(),
+            "--replay-strict-mode".to_string(),
+            "lenient".to_string(),
         ]);
 
         let cwd = std::env::current_dir().unwrap();

@@ -61,13 +61,11 @@ impl DejaRedisPool {
         if let Some(trace_id) = current_trace_id() {
             // Inject trace ID into connection name for in-band proxy detection
             let setname_cmd = format!("deja:{}", trace_id);
-            let _: Result<String, _> =
-                redis::cmd("CLIENT")
-                    .arg("SETNAME")
-                    .arg(&setname_cmd)
-                    .query_async(&mut conn)
-                    .await;
-
+            let _: Result<String, _> = redis::cmd("CLIENT")
+                .arg("SETNAME")
+                .arg(&setname_cmd)
+                .query_async(&mut conn)
+                .await;
         }
 
         Ok(conn)

@@ -4,11 +4,11 @@
 //! Supports concurrent traces without global state.
 
 use crate::buffer::{PendingEventBuffer, QuarantinedEvents};
-    use deja_common::{ConnectionKey, Protocol, ScopeId, ScopeSequenceTracker};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::{oneshot, RwLock};
-    use tracing::{debug, info, warn};
+use deja_common::{ConnectionKey, Protocol, ScopeId, ScopeSequenceTracker};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{oneshot, RwLock};
+use tracing::{debug, info, warn};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlOrderingDecision {
@@ -368,34 +368,34 @@ impl TraceCorrelator {
                         });
                     }
                     if conn_map.contains_key(&key) {
-                        return Err(CorrelationInvariantViolation::PendingStateHasRegisteredTrace {
-                            source_port: *source_port,
-                        });
+                        return Err(
+                            CorrelationInvariantViolation::PendingStateHasRegisteredTrace {
+                                source_port: *source_port,
+                            },
+                        );
                     }
                 }
                 ConnectionLifecycleState::Attributed {
-                    trace_id,
-                    protocol,
-                    ..
+                    trace_id, protocol, ..
                 } => {
                     if trace_id.is_empty() || trace_id == "orphan" {
-                        return Err(CorrelationInvariantViolation::AttributedStateUsesOrphanTrace {
-                            source_port: *source_port,
-                        });
+                        return Err(
+                            CorrelationInvariantViolation::AttributedStateUsesOrphanTrace {
+                                source_port: *source_port,
+                            },
+                        );
                     }
 
                     match conn_map.get(&key) {
                         Some((mapped_trace_id, mapped_protocol))
                             if mapped_trace_id == trace_id && mapped_protocol == protocol => {}
-                        Some((mapped_trace_id, _)) => {
-                            return Err(
-                                CorrelationInvariantViolation::AttributedStateMismatchedRegistration {
-                                    source_port: *source_port,
-                                    expected_trace_id: trace_id.clone(),
-                                    actual_trace_id: mapped_trace_id.clone(),
-                                },
-                            )
-                        }
+                        Some((mapped_trace_id, _)) => return Err(
+                            CorrelationInvariantViolation::AttributedStateMismatchedRegistration {
+                                source_port: *source_port,
+                                expected_trace_id: trace_id.clone(),
+                                actual_trace_id: mapped_trace_id.clone(),
+                            },
+                        ),
                         None => {
                             return Err(
                                 CorrelationInvariantViolation::AttributedStateMissingRegistration {
@@ -431,9 +431,9 @@ impl TraceCorrelator {
                 states.get(&source_port),
                 Some(ConnectionLifecycleState::Attributed { .. })
             ) {
-                return Err(CorrelationInvariantViolation::RegisteredConnectionMissingState {
-                    source_port,
-                });
+                return Err(
+                    CorrelationInvariantViolation::RegisteredConnectionMissingState { source_port },
+                );
             }
         }
 
@@ -566,8 +566,12 @@ impl TraceCorrelator {
 
         // Try source-port-only key (backward compat with AssociateBySourcePort)
         let port_key = ConnectionKey::from_source_port(peer_port);
-        if let Some((trace_id, protocol)) =
-            self.connection_key_to_trace.read().await.get(&port_key).cloned()
+        if let Some((trace_id, protocol)) = self
+            .connection_key_to_trace
+            .read()
+            .await
+            .get(&port_key)
+            .cloned()
         {
             self.connection_lifecycle.write().await.insert(
                 peer_port,
@@ -591,10 +595,13 @@ impl TraceCorrelator {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        self.pending_connections
-            .write()
-            .await
-            .insert(peer_port, PendingConnection { sender: tx, created_at_ns: now_ns });
+        self.pending_connections.write().await.insert(
+            peer_port,
+            PendingConnection {
+                sender: tx,
+                created_at_ns: now_ns,
+            },
+        );
         self.connection_lifecycle
             .write()
             .await
@@ -643,22 +650,28 @@ impl TraceCorrelator {
         );
 
         // Translate outgoing port to peer port if this is the proxy's outgoing port
-        let effective_port = if let Some(peer_port) = self.outgoing_to_peer_port.read().await.get(&source_port) {
-            debug!(
-                outgoing_port = source_port,
-                peer_port = *peer_port,
-                "Translated outgoing port to peer port"
-            );
-            *peer_port
-        } else {
-            source_port
-        };
+        let effective_port =
+            if let Some(peer_port) = self.outgoing_to_peer_port.read().await.get(&source_port) {
+                debug!(
+                    outgoing_port = source_port,
+                    peer_port = *peer_port,
+                    "Translated outgoing port to peer port"
+                );
+                *peer_port
+            } else {
+                source_port
+            };
         let source_port = effective_port;
 
         if let Some(ConnectionLifecycleState::Attributed {
             trace_id: existing_trace_id,
             ..
-        }) = self.connection_lifecycle.read().await.get(&source_port).cloned()
+        }) = self
+            .connection_lifecycle
+            .read()
+            .await
+            .get(&source_port)
+            .cloned()
         {
             if existing_trace_id != trace_id {
                 self.reject_transition(TransitionRejection::ImplicitTraceRebind {
@@ -701,8 +714,11 @@ impl TraceCorrelator {
         }
 
         // Flush any buffered events for retro-binding
-        let scope_id = ScopeId::connection(trace_id, self.get_connection_index(trace_id).await as u64);
-        let flushed = self.flush_buffered_events_on_bind(source_port, &scope_id, trace_id).await;
+        let scope_id =
+            ScopeId::connection(trace_id, self.get_connection_index(trace_id).await as u64);
+        let flushed = self
+            .flush_buffered_events_on_bind(source_port, &scope_id, trace_id)
+            .await;
         if !flushed.is_empty() {
             info!(
                 source_port = source_port,
@@ -791,10 +807,7 @@ impl TraceCorrelator {
 
     /// Get next global_sequence
     pub async fn next_global_sequence(&self) -> u64 {
-        self.sequence_tracker
-            .read()
-            .await
-            .next_global_sequence()
+        self.sequence_tracker.read().await.next_global_sequence()
     }
 
     /// Get trace metadata
@@ -870,7 +883,7 @@ impl TraceCorrelator {
             .await;
     }
 
-/// Time out pending connections that have been waiting too long without resolution
+    /// Time out pending connections that have been waiting too long without resolution
     ///
     /// These connections become confirmed orphans since they will never be attributed.
     pub async fn timeout_orphan_connections(&self, max_wait_ns: u64) {
@@ -901,10 +914,7 @@ impl TraceCorrelator {
                 .await
                 .known_orphan_timed_out
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            debug!(
-                source_port = orphan_port,
-                "Orphan connection timed out"
-            );
+            debug!(source_port = orphan_port, "Orphan connection timed out");
         }
 
         let mut lifecycles = self.connection_lifecycle.write().await;
@@ -975,7 +985,9 @@ impl TraceCorrelator {
             let mut states = self.connection_lifecycle.write().await;
             states.retain(|_, state| match state {
                 ConnectionLifecycleState::PendingAssociation => true,
-                ConnectionLifecycleState::Attributed { trace_id, .. } => !removed.contains(trace_id),
+                ConnectionLifecycleState::Attributed { trace_id, .. } => {
+                    !removed.contains(trace_id)
+                }
             });
 
             // Clean up buffers for removed traces
@@ -1021,7 +1033,10 @@ impl TraceCorrelator {
         source_port: u16,
         scope_id: &ScopeId,
         trace_id: &str,
-    ) -> Vec<(deja_core::events::RecordedEvent, deja_core::events::EventDirection)> {
+    ) -> Vec<(
+        deja_core::events::RecordedEvent,
+        deja_core::events::EventDirection,
+    )> {
         let mut buffers = self.pending_event_buffers.write().await;
         if let Some(buffer) = buffers.get_mut(&source_port) {
             buffer.flush_for_bind(source_port, scope_id, trace_id)
@@ -1034,7 +1049,10 @@ impl TraceCorrelator {
     pub async fn quarantine_expired_events(
         &self,
         source_port: u16,
-    ) -> Vec<(deja_core::events::RecordedEvent, deja_core::events::EventDirection)> {
+    ) -> Vec<(
+        deja_core::events::RecordedEvent,
+        deja_core::events::EventDirection,
+    )> {
         let mut buffers = self.pending_event_buffers.write().await;
         if let Some(buffer) = buffers.get_mut(&source_port) {
             buffer.quarantine_expired(source_port)
@@ -1047,7 +1065,10 @@ impl TraceCorrelator {
     pub async fn add_to_quarantine(
         &self,
         source_port: u16,
-        events: Vec<(deja_core::events::RecordedEvent, deja_core::events::EventDirection)>,
+        events: Vec<(
+            deja_core::events::RecordedEvent,
+            deja_core::events::EventDirection,
+        )>,
     ) {
         let mut quarantine = self.quarantined_events.write().await;
         quarantine.add_batch(source_port, events);
@@ -1060,7 +1081,10 @@ impl TraceCorrelator {
 
     /// Clear pending buffer for a port (called on connection close)
     pub async fn clear_pending_buffer(&self, source_port: u16) {
-        self.pending_event_buffers.write().await.remove(&source_port);
+        self.pending_event_buffers
+            .write()
+            .await
+            .remove(&source_port);
     }
 
     /// Helper for test timing (returns current time in nanoseconds)
@@ -1173,9 +1197,7 @@ mod tests {
             .await;
 
         // New connection from port 50000 should resolve immediately
-        let result = correlator
-            .on_new_connection(50000, Protocol::Unknown)
-            .await;
+        let result = correlator.on_new_connection(50000, Protocol::Unknown).await;
         assert!(result.is_ok());
         let assoc = result.unwrap();
         assert_eq!(assoc.trace_id, "t1");
@@ -1189,9 +1211,7 @@ mod tests {
         correlator.start_trace("t1".into(), 1000).await;
 
         // Connection arrives before SDK registers
-        let result = correlator
-            .on_new_connection(50001, Protocol::Http)
-            .await;
+        let result = correlator.on_new_connection(50001, Protocol::Http).await;
         assert!(result.is_err()); // Returns a receiver
 
         let rx = result.unwrap_err();
@@ -1297,7 +1317,9 @@ mod tests {
         correlator.release_lease(50100).await;
         assert!(correlator.check_invariants().await.is_ok());
 
-        correlator.reassociate("t2", 50100, Protocol::Postgres).await;
+        correlator
+            .reassociate("t2", 50100, Protocol::Postgres)
+            .await;
         assert!(correlator.check_invariants().await.is_ok());
 
         let second = correlator
@@ -1435,7 +1457,10 @@ mod tests {
         let second = correlator
             .pool_checkout("t2", 50201, Protocol::Postgres)
             .await;
-        assert!(second.is_err(), "double checkout without return must be rejected");
+        assert!(
+            second.is_err(),
+            "double checkout without return must be rejected"
+        );
         assert_eq!(correlator.invalid_transition_count().await, 1);
 
         // Connection should still be attributed to t1
@@ -1485,7 +1510,10 @@ mod tests {
         let checkout2 = correlator
             .pool_checkout("t2", 50202, Protocol::Postgres)
             .await;
-        assert!(checkout2.is_ok(), "checkout after reassociate should succeed");
+        assert!(
+            checkout2.is_ok(),
+            "checkout after reassociate should succeed"
+        );
         assert_eq!(correlator.invalid_transition_count().await, 0);
     }
 
@@ -1543,9 +1571,7 @@ mod tests {
 
         assert_eq!(correlator.invalid_transition_count().await, 1);
 
-        let pending = correlator
-            .on_new_connection(60001, Protocol::Unknown)
-            .await;
+        let pending = correlator.on_new_connection(60001, Protocol::Unknown).await;
         assert!(pending.is_err(), "port should remain in pending state");
     }
 
@@ -1564,14 +1590,13 @@ mod tests {
         let correlator = TraceCorrelator::new();
         correlator.start_trace("t1".into(), 1000).await;
 
-        let first = correlator
-            .on_new_connection(60003, Protocol::Http)
-            .await;
-        assert!(first.is_err(), "first attempt should return pending receiver");
+        let first = correlator.on_new_connection(60003, Protocol::Http).await;
+        assert!(
+            first.is_err(),
+            "first attempt should return pending receiver"
+        );
 
-        let second = correlator
-            .on_new_connection(60003, Protocol::Http)
-            .await;
+        let second = correlator.on_new_connection(60003, Protocol::Http).await;
         assert!(second.is_err(), "duplicate pending should be rejected");
 
         assert_eq!(correlator.invalid_transition_count().await, 1);
@@ -1753,7 +1778,12 @@ mod tests {
             .await;
 
         assert_eq!(
-            correlator.metrics.read().await.quarantine_events.load(std::sync::atomic::Ordering::Relaxed),
+            correlator
+                .metrics
+                .read()
+                .await
+                .quarantine_events
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "No quarantine events when buffer is empty"
         );
@@ -1773,7 +1803,12 @@ mod tests {
 
         // Verify no metrics counted yet
         assert_eq!(
-            correlator.metrics.read().await.late_binds.load(std::sync::atomic::Ordering::Relaxed),
+            correlator
+                .metrics
+                .read()
+                .await
+                .late_binds
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "No late binds before association"
         );
@@ -1785,7 +1820,12 @@ mod tests {
 
         // Verify late bind was counted
         assert_eq!(
-            correlator.metrics.read().await.late_binds.load(std::sync::atomic::Ordering::Relaxed),
+            correlator
+                .metrics
+                .read()
+                .await
+                .late_binds
+                .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "One late bind counted when association resolves pending connection"
         );
@@ -1820,9 +1860,7 @@ mod tests {
         );
 
         // Timeout the orphan connection using short window (10ns)
-        correlator
-            .timeout_orphan_connections(10)
-            .await;
+        correlator.timeout_orphan_connections(10).await;
 
         // Verify orphan was counted
         assert_eq!(
@@ -1838,7 +1876,12 @@ mod tests {
 
         // Verify pending state cleaned up
         assert!(
-            correlator.pending_connections.read().await.get(&7002).is_none(),
+            correlator
+                .pending_connections
+                .read()
+                .await
+                .get(&7002)
+                .is_none(),
             "Pending connection removed after timeout"
         );
         assert!(correlator.check_invariants().await.is_ok());
@@ -1873,24 +1916,31 @@ mod tests {
 
         // Verify late bind counter
         assert_eq!(
-            correlator.metrics.read().await.late_binds.load(std::sync::atomic::Ordering::Relaxed),
+            correlator
+                .metrics
+                .read()
+                .await
+                .late_binds
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
 
         // Use timeout to avoid indefinite wait - if this hangs, we'll detect it
-        let assoc1 = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            pending1
-        )
-        .await
-        .expect("pending1 should resolve");
+        let assoc1 = tokio::time::timeout(std::time::Duration::from_millis(200), pending1)
+            .await
+            .expect("pending1 should resolve");
 
         let assoc = assoc1.expect("reachable");
         assert_eq!(assoc.trace_id, "t1");
 
         // Verify successful associations
         assert_eq!(
-            correlator.metrics.read().await.successful_associations.load(std::sync::atomic::Ordering::Relaxed),
+            correlator
+                .metrics
+                .read()
+                .await
+                .successful_associations
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
 
@@ -1961,9 +2011,17 @@ mod tests {
             .unwrap_err();
 
         // Verify pending state exists
-        assert!(correlator.pending_connections.read().await.contains_key(&50001));
+        assert!(correlator
+            .pending_connections
+            .read()
+            .await
+            .contains_key(&50001));
         assert!(
-            correlator.connection_lifecycle.read().await.contains_key(&50001),
+            correlator
+                .connection_lifecycle
+                .read()
+                .await
+                .contains_key(&50001),
             "Lifecycle state should exist for pending connection"
         );
 
@@ -1972,11 +2030,19 @@ mod tests {
 
         // Verify both maps are cleaned
         assert!(
-            !correlator.pending_connections.read().await.contains_key(&50001),
+            !correlator
+                .pending_connections
+                .read()
+                .await
+                .contains_key(&50001),
             "Pending connection should be removed"
         );
         assert!(
-            !correlator.connection_lifecycle.read().await.contains_key(&50001),
+            !correlator
+                .connection_lifecycle
+                .read()
+                .await
+                .contains_key(&50001),
             "Lifecycle state should be removed for pending"
         );
 
@@ -2010,19 +2076,35 @@ mod tests {
 
         // Verify cleanup
         assert!(
-            !correlator.pending_connections.read().await.contains_key(&50002),
+            !correlator
+                .pending_connections
+                .read()
+                .await
+                .contains_key(&50002),
             "Orphan 50002 should be removed"
         );
         assert!(
-            !correlator.pending_connections.read().await.contains_key(&50003),
+            !correlator
+                .pending_connections
+                .read()
+                .await
+                .contains_key(&50003),
             "Orphan 50003 should be removed"
         );
         assert!(
-            !correlator.connection_lifecycle.read().await.contains_key(&50002),
+            !correlator
+                .connection_lifecycle
+                .read()
+                .await
+                .contains_key(&50002),
             "Lifecycle should be cleaned for orphan"
         );
         assert!(
-            !correlator.connection_lifecycle.read().await.contains_key(&50003),
+            !correlator
+                .connection_lifecycle
+                .read()
+                .await
+                .contains_key(&50003),
             "Lifecycle should be cleaned for orphan"
         );
 
@@ -2060,7 +2142,11 @@ mod tests {
 
         // Verify trace is removed
         assert!(
-            !correlator.active_traces.read().await.contains_key("t_cleanup"),
+            !correlator
+                .active_traces
+                .read()
+                .await
+                .contains_key("t_cleanup"),
             "Old trace should be removed"
         );
 
@@ -2078,11 +2164,19 @@ mod tests {
 
         // Verify lifecycle states are cleaned
         assert!(
-            !correlator.connection_lifecycle.read().await.contains_key(&50004),
+            !correlator
+                .connection_lifecycle
+                .read()
+                .await
+                .contains_key(&50004),
             "Lifecycle should be cleaned for removed trace"
         );
         assert!(
-            !correlator.connection_lifecycle.read().await.contains_key(&50005),
+            !correlator
+                .connection_lifecycle
+                .read()
+                .await
+                .contains_key(&50005),
             "Lifecycle should be cleaned for removed trace"
         );
 
@@ -2187,11 +2281,19 @@ mod tests {
 
         // Verify lifecycle states
         assert!(
-            correlator.connection_lifecycle.read().await.contains_key(&50007),
+            correlator
+                .connection_lifecycle
+                .read()
+                .await
+                .contains_key(&50007),
             "Active trace lifecycle should be preserved"
         );
         assert!(
-            !correlator.connection_lifecycle.read().await.contains_key(&50008),
+            !correlator
+                .connection_lifecycle
+                .read()
+                .await
+                .contains_key(&50008),
             "Ended trace lifecycle should be removed"
         );
 
@@ -2267,15 +2369,27 @@ mod tests {
 
         // Verify consistency
         assert!(
-            !correlator.pending_connections.read().await.contains_key(&50010),
+            !correlator
+                .pending_connections
+                .read()
+                .await
+                .contains_key(&50010),
             "Associated connection should be removed from pending"
         );
         assert!(
-            !correlator.pending_connections.read().await.contains_key(&50011),
+            !correlator
+                .pending_connections
+                .read()
+                .await
+                .contains_key(&50011),
             "Cleared connection should be removed"
         );
         assert!(
-            !correlator.pending_connections.read().await.contains_key(&50012),
+            !correlator
+                .pending_connections
+                .read()
+                .await
+                .contains_key(&50012),
             "Cleared connection should be removed"
         );
 

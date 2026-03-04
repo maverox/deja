@@ -127,12 +127,7 @@ impl Runtime {
         Self::new_internal(proxy_url, mode, trace_id, "0".to_string())
     }
 
-    fn new_internal(
-        proxy_url: String,
-        mode: DejaMode,
-        trace_id: String,
-        task_id: String,
-    ) -> Self {
+    fn new_internal(proxy_url: String, mode: DejaMode, trace_id: String, task_id: String) -> Self {
         let scope_id = if trace_id.is_empty() {
             ScopeId::from_raw("")
         } else {
@@ -158,12 +153,7 @@ impl Runtime {
 
     /// Create a copy of this runtime bound to a new trace_id (root task).
     pub fn with_trace_id(&self, trace_id: String) -> Self {
-        Self::new_internal(
-            self.proxy_url.clone(),
-            self.mode,
-            trace_id,
-            "0".to_string(),
-        )
+        Self::new_internal(self.proxy_url.clone(), self.mode, trace_id, "0".to_string())
     }
 
     /// Get the next sequence number for a given kind, incrementing the counter.
@@ -212,10 +202,12 @@ impl Runtime {
     /// Check if flush is needed based on threshold or time
     async fn maybe_flush(&self) {
         let should_flush = {
-            let pending = self.pending_captures.lock().unwrap_or_else(|e| e.into_inner());
+            let pending = self
+                .pending_captures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let last_flush = self.last_flush.lock().unwrap_or_else(|e| e.into_inner());
-            pending.len() >= self.flush_threshold
-                || last_flush.elapsed() > self.flush_interval
+            pending.len() >= self.flush_threshold || last_flush.elapsed() > self.flush_interval
         };
 
         if should_flush {
@@ -225,7 +217,10 @@ impl Runtime {
 
     async fn flush_impl(&self) {
         let captures: Vec<QueuedCapture> = {
-            let mut pending = self.pending_captures.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self
+                .pending_captures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             pending.drain(..).collect()
         };
 
@@ -295,7 +290,10 @@ impl DejaRuntime for Runtime {
 
         // Add to pending captures
         {
-            let mut pending = self.pending_captures.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self
+                .pending_captures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             pending.push(QueuedCapture {
                 trace_id,
                 task_id,
@@ -463,12 +461,7 @@ impl SyncDejaRuntime for Runtime {
         let scope_id = self.current_scope_id_for_runtime(&trace_id, &task_id);
         let url = format!(
             "{}/replay?trace_id={}&task_id={}&scope_id={}&kind={}&seq={}",
-            self.proxy_url,
-            trace_id,
-            task_id,
-            scope_id,
-            kind,
-            seq
+            self.proxy_url, trace_id, task_id, scope_id, kind, seq
         );
 
         use std::sync::OnceLock;

@@ -120,9 +120,7 @@ where
         .scope(trace_id, async {
             TASK_ID
                 .scope("0".to_string(), async {
-                    CHILD_COUNTER
-                        .scope(AtomicU64::new(0), future)
-                        .await
+                    CHILD_COUNTER.scope(AtomicU64::new(0), future).await
                 })
                 .await
         })
@@ -157,9 +155,7 @@ where
             .scope(parent_trace, async {
                 TASK_ID
                     .scope(task_id_clone, async {
-                        CHILD_COUNTER
-                            .scope(AtomicU64::new(0), future)
-                            .await
+                        CHILD_COUNTER.scope(AtomicU64::new(0), future).await
                     })
                     .await
             })
@@ -208,10 +204,7 @@ mod tests {
     #[tokio::test]
     async fn test_with_trace_id_sets_context() {
         let trace_id = "test-trace-123".to_string();
-        let result = with_trace_id(trace_id.clone(), async {
-            current_trace_id()
-        })
-        .await;
+        let result = with_trace_id(trace_id.clone(), async { current_trace_id() }).await;
 
         assert_eq!(result, Some(trace_id));
     }
@@ -238,10 +231,7 @@ mod tests {
             assert_eq!(current_trace_id(), Some(outer_id.clone()));
 
             // Inner context overrides outer
-            let inner_result = with_trace_id(inner_id.clone(), async {
-                current_trace_id()
-            })
-            .await;
+            let inner_result = with_trace_id(inner_id.clone(), async { current_trace_id() }).await;
 
             assert_eq!(inner_result, Some(inner_id));
 
@@ -280,14 +270,10 @@ mod tests {
 
         let result = with_trace_context(trace_id.clone(), async {
             // Spawn first child
-            let (handle1, task_id1) = spawn_with_task_id(async {
-                current_task_id()
-            });
+            let (handle1, task_id1) = spawn_with_task_id(async { current_task_id() });
 
             // Spawn second child
-            let (handle2, task_id2) = spawn_with_task_id(async {
-                current_task_id()
-            });
+            let (handle2, task_id2) = spawn_with_task_id(async { current_task_id() });
 
             let child1_result = handle1.await.unwrap();
             let child2_result = handle2.await.unwrap();
@@ -309,9 +295,7 @@ mod tests {
         let result = with_trace_context(trace_id.clone(), async {
             let (outer_handle, outer_task_id) = spawn_with_task_id(async {
                 // Spawn from inside the child
-                let (inner_handle, inner_task_id) = spawn_with_task_id(async {
-                    current_task_id()
-                });
+                let (inner_handle, inner_task_id) = spawn_with_task_id(async { current_task_id() });
 
                 let inner_result = inner_handle.await.unwrap();
                 (inner_task_id, inner_result)
@@ -332,9 +316,7 @@ mod tests {
         let trace_id = "traced-spawn-test".to_string();
 
         let result = with_trace_context(trace_id.clone(), async {
-            let handle = spawn_traced(async {
-                current_trace_id()
-            });
+            let handle = spawn_traced(async { current_trace_id() });
 
             handle.await.unwrap()
         })
@@ -348,9 +330,7 @@ mod tests {
         let trace_id = "lineage-test-1".to_string();
 
         let result = with_trace_context(trace_id.clone(), async {
-            let (handle, task_id) = spawn_with_task_id(async {
-                current_task_id()
-            });
+            let (handle, task_id) = spawn_with_task_id(async { current_task_id() });
 
             let inner_task_id = handle.await.unwrap();
             (task_id, inner_task_id)
@@ -369,9 +349,7 @@ mod tests {
             let mut task_ids = Vec::new();
 
             for _ in 0..3 {
-                let (handle, task_id) = spawn_with_task_id(async {
-                    current_task_id()
-                });
+                let (handle, task_id) = spawn_with_task_id(async { current_task_id() });
                 let inner_id = handle.await.unwrap();
                 task_ids.push((task_id, inner_id));
             }
@@ -397,9 +375,7 @@ mod tests {
                 let mut inner_ids = Vec::new();
 
                 for _ in 0..2 {
-                    let (handle, task_id) = spawn_with_task_id(async {
-                        current_task_id()
-                    });
+                    let (handle, task_id) = spawn_with_task_id(async { current_task_id() });
                     let inner_id = handle.await.unwrap();
                     inner_ids.push((task_id, inner_id));
                 }
@@ -425,18 +401,14 @@ mod tests {
         let trace_id_2 = "lineage-test-4b".to_string();
 
         let result1 = with_trace_context(trace_id_1.clone(), async {
-            let (handle, task_id) = spawn_with_task_id(async {
-                current_task_id()
-            });
+            let (handle, task_id) = spawn_with_task_id(async { current_task_id() });
             let inner_id = handle.await.unwrap();
             (task_id, inner_id)
         })
         .await;
 
         let result2 = with_trace_context(trace_id_2.clone(), async {
-            let (handle, task_id) = spawn_with_task_id(async {
-                current_task_id()
-            });
+            let (handle, task_id) = spawn_with_task_id(async { current_task_id() });
             let inner_id = handle.await.unwrap();
             (task_id, inner_id)
         })
@@ -444,7 +416,7 @@ mod tests {
 
         assert_eq!(result1.0, "0.0");
         assert_eq!(result1.1, Some("0.0".to_string()));
-assert_eq!(result2.0, "0.0");
+        assert_eq!(result2.0, "0.0");
         assert_eq!(result2.1, Some("0.0".to_string()));
     }
 }

@@ -2,7 +2,6 @@ use actix_web::{web, App, HttpServer};
 use clap::Parser;
 use deja_sdk::reqwest::DejaClient;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use test_server::{
     connector::connector_server::ConnectorServer,
     connector_service::ConnectorService,
@@ -19,7 +18,11 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Unified Test Server for Deja proxy integration testing")]
+#[command(
+    author,
+    version,
+    about = "Unified Test Server for Deja proxy integration testing"
+)]
 struct Args {
     #[arg(short, long, default_value = "50051")]
     grpc_port: u16,
@@ -42,7 +45,10 @@ struct Args {
     #[arg(long, default_value = "./recordings")]
     recording_path: String,
 
-    #[arg(long, default_value = "postgres://deja_user:password@localhost:5433/deja_test")]
+    #[arg(
+        long,
+        default_value = "postgres://deja_user:password@localhost:5433/deja_test"
+    )]
     pg_url: String,
 
     #[arg(long, default_value = "redis://localhost:6390")]
@@ -146,7 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let test_service = TestServiceImpl::new(backend_url);
     let test_service_addr: SocketAddr = format!("0.0.0.0:{}", args.grpc_port).parse()?;
-    info!("🌐 TestService gRPC server listening on {}", test_service_addr);
+    info!(
+        "🌐 TestService gRPC server listening on {}",
+        test_service_addr
+    );
 
     tokio::select! {
         result = http_handle => {

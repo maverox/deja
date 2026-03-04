@@ -40,4 +40,3 @@ impl IndexStore for NoopStore {
         Ok(None)
     }
 }
-

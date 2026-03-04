@@ -49,19 +49,18 @@ pub async fn get_pg_source_port(conn: &mut sqlx::postgres::PgConnection) -> Opti
     debug!("PostgreSQL backend PID: {}", pid);
 
     // Query pg_stat_activity for our client port
-    let client_port: Option<i32> = match sqlx::query_scalar(
-        "SELECT client_port FROM pg_stat_activity WHERE pid = $1"
-    )
-    .bind(pid)
-    .fetch_optional(&mut *conn)
-    .await
-    {
-        Ok(port) => port,
-        Err(e) => {
-            warn!("Failed to query pg_stat_activity: {}", e);
-            return None;
-        }
-    };
+    let client_port: Option<i32> =
+        match sqlx::query_scalar("SELECT client_port FROM pg_stat_activity WHERE pid = $1")
+            .bind(pid)
+            .fetch_optional(&mut *conn)
+            .await
+        {
+            Ok(port) => port,
+            Err(e) => {
+                warn!("Failed to query pg_stat_activity: {}", e);
+                return None;
+            }
+        };
 
     client_port.and_then(|p| {
         if p > 0 && p <= u16::MAX as i32 {
@@ -85,9 +84,7 @@ pub async fn get_pg_source_port(conn: &mut sqlx::postgres::PgConnection) -> Opti
 /// # Returns
 ///
 /// The source port of the client connection, or None if it couldn't be determined.
-pub async fn get_redis_source_port(
-    conn: &mut redis::aio::MultiplexedConnection,
-) -> Option<u16> {
+pub async fn get_redis_source_port(conn: &mut redis::aio::MultiplexedConnection) -> Option<u16> {
     // Get our client ID
     let client_id: i64 = match redis::cmd("CLIENT")
         .arg("ID")
@@ -135,7 +132,10 @@ pub async fn get_redis_source_port(
         }
     }
 
-    warn!("Could not find client port in Redis CLIENT LIST for id={}", client_id);
+    warn!(
+        "Could not find client port in Redis CLIENT LIST for id={}",
+        client_id
+    );
     None
 }
 
@@ -222,7 +222,7 @@ mod tests {
     fn test_parse_redis_client_list() {
         // Test parsing of Redis CLIENT LIST output
         let client_list = "id=5 addr=127.0.0.1:54321 fd=8 name= age=0 idle=0 flags=N db=0 sub=0 psub=0 multi=-1 qbuf=0 qbuf-free=32768 obl=0 oll=0 omem=0 events=r cmd=client";
-        
+
         // Simulate finding the line with our ID
         let client_id = 5i64;
         for line in client_list.lines() {

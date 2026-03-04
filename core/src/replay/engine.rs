@@ -40,10 +40,7 @@ pub type ReplayMatch = (RecordedEvent, Vec<RecordedEvent>, Vec<bytes::Bytes>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayMatchError {
-    UnresolvedAttribution {
-        trace_id: String,
-        scope_id: String,
-    },
+    UnresolvedAttribution { trace_id: String, scope_id: String },
 }
 
 impl ReplayMatchError {
@@ -289,14 +286,19 @@ impl ReplayEngine {
         // Try legacy protocol-based lookup as last resort
         let protocol = RecordingIndex::detect_event_protocol(incoming);
         if protocol != Protocol::Unknown {
-            let legacy_seq = self.sequence_tracker.peek_scope_sequence(
-                &ScopeId::from_raw(&format!("legacy:{}:{}", trace_id, protocol)),
-            );
+            let legacy_seq = self
+                .sequence_tracker
+                .peek_scope_sequence(&ScopeId::from_raw(&format!(
+                    "legacy:{}:{}",
+                    trace_id, protocol
+                )));
             if let Some(exchange) = self.index.get(trace_id, protocol, legacy_seq) {
                 if self.match_request(incoming, &exchange.client_message) {
-                    self.sequence_tracker.next_scope_sequence(
-                        &ScopeId::from_raw(&format!("legacy:{}:{}", trace_id, protocol)),
-                    );
+                    self.sequence_tracker
+                        .next_scope_sequence(&ScopeId::from_raw(&format!(
+                            "legacy:{}:{}",
+                            trace_id, protocol
+                        )));
                     tracing::info!(
                         "[ReplayEngine] Legacy protocol match: {:?} seq={}",
                         protocol,
@@ -309,7 +311,6 @@ impl ReplayEngine {
                     ));
                 }
             }
-
         }
 
         warn!(
@@ -398,10 +399,7 @@ impl ReplayEngine {
                 (
                     Some(pg_message_event::Message::Query(inc_q)),
                     Some(pg_message_event::Message::Query(rec_q)),
-                ) => {
-                    !self.match_config.postgres.compare_query_text
-                        || inc_q.query == rec_q.query
-                }
+                ) => !self.match_config.postgres.compare_query_text || inc_q.query == rec_q.query,
                 (
                     Some(pg_message_event::Message::Startup(inc_s)),
                     Some(pg_message_event::Message::Startup(rec_s)),
@@ -409,10 +407,7 @@ impl ReplayEngine {
                 (
                     Some(pg_message_event::Message::Parse(inc_p)),
                     Some(pg_message_event::Message::Parse(rec_p)),
-                ) => {
-                    !self.match_config.postgres.compare_query_text
-                        || inc_p.query == rec_p.query
-                }
+                ) => !self.match_config.postgres.compare_query_text || inc_p.query == rec_p.query,
                 (
                     Some(pg_message_event::Message::Bind(_)),
                     Some(pg_message_event::Message::Bind(_)),
@@ -560,18 +555,25 @@ impl ReplayEngine {
         None
     }
 
-    fn matches_nd_kind(
-        &self,
-        nd_event: &crate::events::NonDeterministicEvent,
-        kind: &str,
-    ) -> bool {
+    fn matches_nd_kind(&self, nd_event: &crate::events::NonDeterministicEvent, kind: &str) -> bool {
         if let Some(k) = &nd_event.kind {
             match (kind, k) {
-                ("uuid" | "uuid_v7", crate::events::non_deterministic_event::Kind::UuidCapture(_)) => true,
+                (
+                    "uuid" | "uuid_v7",
+                    crate::events::non_deterministic_event::Kind::UuidCapture(_),
+                ) => true,
                 ("time", crate::events::non_deterministic_event::Kind::TimeCaptureNs(_)) => true,
-                ("random", crate::events::non_deterministic_event::Kind::RandomSeedCapture(_)) => true,
-                ("task_spawn", crate::events::non_deterministic_event::Kind::TaskSpawnCapture(_)) => true,
-                ("random_bytes", crate::events::non_deterministic_event::Kind::RandomBytesCapture(_)) => true,
+                ("random", crate::events::non_deterministic_event::Kind::RandomSeedCapture(_)) => {
+                    true
+                }
+                (
+                    "task_spawn",
+                    crate::events::non_deterministic_event::Kind::TaskSpawnCapture(_),
+                ) => true,
+                (
+                    "random_bytes",
+                    crate::events::non_deterministic_event::Kind::RandomBytesCapture(_),
+                ) => true,
                 ("nanoid", crate::events::non_deterministic_event::Kind::NanoidCapture(_)) => true,
                 _ => false,
             }

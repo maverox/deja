@@ -41,14 +41,16 @@ async fn test_nondeterministic_uuid_generation() {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
-    }).await;
+    })
+    .await;
     sleep(Duration::from_millis(10)).await;
     let ts2: u64 = deja_sdk::deja_run(&runtime, "time", || {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
-    }).await;
+    })
+    .await;
 
     assert!(ts2 > ts1, "Timestamps should increase");
     println!("⏱️ TS1: {}, TS2: {}, diff: {}ms", ts1, ts2, ts2 - ts1);
@@ -59,13 +61,15 @@ async fn test_nondeterministic_uuid_generation() {
         let mut bytes = vec![0u8; 16];
         rand::thread_rng().fill(&mut bytes[..]);
         bytes
-    }).await;
+    })
+    .await;
     let random2: Vec<u8> = deja_sdk::deja_run(&runtime, "random_bytes", || {
         use rand::Rng;
         let mut bytes = vec![0u8; 16];
         rand::thread_rng().fill(&mut bytes[..]);
         bytes
-    }).await;
+    })
+    .await;
 
     assert_eq!(random1.len(), 16);
     assert_eq!(random2.len(), 16);

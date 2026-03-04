@@ -224,7 +224,10 @@ impl CrossProtocolTestContext {
                 "GRPC_LISTEN_ADDR",
                 format!("127.0.0.1:{}", self.grpc_service_port),
             )
-            .env("DEJA_CONTROL_URL", format!("http://127.0.0.1:{}", self.control_port))
+            .env(
+                "DEJA_CONTROL_URL",
+                format!("http://127.0.0.1:{}", self.control_port),
+            )
             .env(
                 "DEJA_PROXY_URL",
                 format!("http://127.0.0.1:{}", self.control_port),
@@ -269,10 +272,7 @@ impl CrossProtocolTestContext {
                         let content = std::fs::read_to_string(&events_path).unwrap();
                         for line in content.lines() {
                             if let Some((trace_id, protocol)) = extract_trace_and_protocol(line) {
-                                traces
-                                    .entry(trace_id)
-                                    .or_default()
-                                    .add_event(&protocol);
+                                traces.entry(trace_id).or_default().add_event(&protocol);
                             }
                         }
                     }
@@ -387,7 +387,10 @@ async fn test_cross_protocol_correlation_single_trace() {
         tonic::metadata::MetadataValue::try_from(trace_id).unwrap(),
     );
 
-    println!("[TEST] Sending cross-protocol request with trace: {}", trace_id);
+    println!(
+        "[TEST] Sending cross-protocol request with trace: {}",
+        trace_id
+    );
     let response = client.process(request).await.unwrap().into_inner();
 
     println!("[TEST] Response received: status={}", response.status);
@@ -416,7 +419,10 @@ async fn test_cross_protocol_correlation_single_trace() {
     );
 
     let events = traces.get(trace_id).unwrap();
-    println!("[TEST] Trace {} has {} total events", trace_id, events.total_events);
+    println!(
+        "[TEST] Trace {} has {} total events",
+        trace_id, events.total_events
+    );
     println!("[TEST]   HTTP events: {}", events.http_count);
     println!("[TEST]   Redis events: {}", events.redis_count);
     println!("[TEST]   Postgres events: {}", events.postgres_count);
@@ -461,7 +467,10 @@ async fn test_cross_protocol_correlation_single_trace() {
     print_banner("CROSS-PROTOCOL CORRELATION TEST SUMMARY");
 
     println!("✅ Cross-protocol correlation test passed!");
-    println!("   All validated events are correctly attributed to trace {}", trace_id);
+    println!(
+        "   All validated events are correctly attributed to trace {}",
+        trace_id
+    );
     println!("   Strict attribution validated (no unexpected traces, no cross-contamination)");
 }
 
@@ -518,7 +527,10 @@ async fn test_concurrent_cross_protocol_traces() {
         responses.push(handle.await.unwrap());
     }
 
-    println!("[TEST] ✅ All {} concurrent cross-protocol requests completed!", num_concurrent);
+    println!(
+        "[TEST] ✅ All {} concurrent cross-protocol requests completed!",
+        num_concurrent
+    );
 
     // Allow recording to flush
     sleep(Duration::from_secs(2)).await;
@@ -539,7 +551,11 @@ async fn test_concurrent_cross_protocol_traces() {
     for (trace_id, events) in &traces {
         println!(
             "[TEST] Trace {}: {} events (HTTP={}, Redis={}, Postgres={})",
-            trace_id, events.total_events, events.http_count, events.redis_count, events.postgres_count
+            trace_id,
+            events.total_events,
+            events.http_count,
+            events.redis_count,
+            events.postgres_count
         );
 
         // Each trace should have events
@@ -554,7 +570,10 @@ async fn test_concurrent_cross_protocol_traces() {
         }
     }
 
-    let expected_trace_ids: Vec<String> = responses.iter().map(|(trace_id, _)| trace_id.clone()).collect();
+    let expected_trace_ids: Vec<String> = responses
+        .iter()
+        .map(|(trace_id, _)| trace_id.clone())
+        .collect();
     for expected_trace_id in &expected_trace_ids {
         let maybe_events = traces.get(expected_trace_id);
         assert!(

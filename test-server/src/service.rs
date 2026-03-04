@@ -56,7 +56,8 @@ impl TestService for TestServiceImpl {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0)
-        }).await;
+        })
+        .await;
 
         // Make HTTP call to backend
         let backend_url = if req.backend_url.is_empty() {
@@ -100,7 +101,9 @@ impl TestService for TestServiceImpl {
         let runtime = get_runtime();
 
         let uuid = if req.generate_uuid {
-            deja_run(&*runtime, "uuid", || uuid::Uuid::new_v4()).await.to_string()
+            deja_run(&*runtime, "uuid", || uuid::Uuid::new_v4())
+                .await
+                .to_string()
         } else {
             String::new()
         };
@@ -111,7 +114,8 @@ impl TestService for TestServiceImpl {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0)
-            }).await as i64
+            })
+            .await as i64
         } else {
             0
         };
@@ -128,7 +132,8 @@ impl TestService for TestServiceImpl {
                 let mut bytes = vec![0u8; count];
                 rng.fill(&mut bytes[..]);
                 bytes
-            }).await
+            })
+            .await
         } else {
             Vec::new()
         };
@@ -278,7 +283,8 @@ impl TestService for TestServiceImpl {
                 let random: Vec<u8> = deja_run(&*runtime, "random_failure", || {
                     use rand::Rng;
                     vec![rand::thread_rng().gen::<u8>()]
-                }).await;
+                })
+                .await;
                 if random.first().map(|b| b % 2 == 0).unwrap_or(false) {
                     Err(Status::internal("Random failure"))
                 } else {

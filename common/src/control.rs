@@ -229,10 +229,7 @@ impl ControlMessage {
         }
     }
 
-    pub fn start_trace_with_task(
-        trace_id: impl Into<String>,
-        task_id: impl Into<String>,
-    ) -> Self {
+    pub fn start_trace_with_task(trace_id: impl Into<String>, task_id: impl Into<String>) -> Self {
         let task_id_str = task_id.into();
         Self::StartTrace {
             trace_id: trace_id.into(),
@@ -253,10 +250,7 @@ impl ControlMessage {
         }
     }
 
-    pub fn end_trace_with_task(
-        trace_id: impl Into<String>,
-        task_id: impl Into<String>,
-    ) -> Self {
+    pub fn end_trace_with_task(trace_id: impl Into<String>, task_id: impl Into<String>) -> Self {
         let task_id_str = task_id.into();
         Self::EndTrace {
             trace_id: trace_id.into(),
@@ -311,11 +305,7 @@ impl ControlMessage {
         }
     }
 
-    pub fn pool_return(
-        trace_id: impl Into<String>,
-        source_port: u16,
-        protocol: Protocol,
-    ) -> Self {
+    pub fn pool_return(trace_id: impl Into<String>, source_port: u16, protocol: Protocol) -> Self {
         Self::PoolReturn {
             trace_id: trace_id.into(),
             source_port,
@@ -568,8 +558,7 @@ mod tests {
         let assoc = ControlMessage::associate_by_source_port("trace-3", 5433, Protocol::Postgres);
         assert!(assoc.timestamp_ns() > 0);
 
-        let reassoc =
-            ControlMessage::reassociate_connection("trace-4", 5433, Protocol::Postgres);
+        let reassoc = ControlMessage::reassociate_connection("trace-4", 5433, Protocol::Postgres);
         assert!(reassoc.timestamp_ns() > 0);
 
         let checkout = ControlMessage::pool_checkout("trace-5", 6380, Protocol::Redis, None);
@@ -686,8 +675,7 @@ mod tests {
 
     #[test]
     fn test_task_metadata_with_sender_seq() {
-        let msg = ControlMessage::start_trace_with_task("trace-333", "0.2.1")
-            .with_sender_seq(99);
+        let msg = ControlMessage::start_trace_with_task("trace-333", "0.2.1").with_sender_seq(99);
         match msg {
             ControlMessage::StartTrace {
                 trace_id,

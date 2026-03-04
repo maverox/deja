@@ -124,7 +124,10 @@ async fn test_http_recording_scope_fields() {
     // Group by scope_id and verify scope_sequence ordering
     let mut by_scope: HashMap<String, Vec<&RecordedEvent>> = HashMap::new();
     for event in &events {
-        by_scope.entry(event.scope_id.clone()).or_default().push(event);
+        by_scope
+            .entry(event.scope_id.clone())
+            .or_default()
+            .push(event);
     }
 
     println!("\nScopes found: {}", by_scope.len());
@@ -191,7 +194,10 @@ async fn test_concurrent_connections_separate_scopes() {
     sleep(Duration::from_millis(200)).await;
 
     let events = read_all_recordings(&harness).await;
-    println!("Recorded {} events from 3 concurrent connections", events.len());
+    println!(
+        "Recorded {} events from 3 concurrent connections",
+        events.len()
+    );
 
     // Collect unique scope_ids (excluding empty)
     let scope_ids: HashSet<&str> = events

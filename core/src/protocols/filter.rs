@@ -32,10 +32,7 @@ impl CompiledRule {
     fn from_filter_rule(rule: &FilterRule) -> Self {
         Self {
             protocol: rule.protocol.clone(),
-            service_pattern: rule
-                .service
-                .as_ref()
-                .and_then(|s| Pattern::new(s).ok()),
+            service_pattern: rule.service.as_ref().and_then(|s| Pattern::new(s).ok()),
             method_patterns: rule
                 .methods
                 .iter()
@@ -89,16 +86,15 @@ impl CompiledRule {
         }
 
         // For HTTP, check path patterns
-        if ctx.protocol == "http"
-            && !self.path_patterns.is_empty() {
-                if let Some(ref path) = ctx.path {
-                    if !self.path_patterns.iter().any(|p| p.matches(path)) {
-                        return false;
-                    }
-                } else {
+        if ctx.protocol == "http" && !self.path_patterns.is_empty() {
+            if let Some(ref path) = ctx.path {
+                if !self.path_patterns.iter().any(|p| p.matches(path)) {
                     return false;
                 }
+            } else {
+                return false;
             }
+        }
 
         // Check metadata patterns: all specified patterns must match
         for (key, pattern) in &self.metadata_patterns {
@@ -284,8 +280,7 @@ mod tests {
         let filter = RecordingFilter::from_config(&config);
 
         // Health check should be excluded
-        let health_ctx =
-            FilterContext::grpc("grpc.health.v1.Health", "Check", HashMap::new());
+        let health_ctx = FilterContext::grpc("grpc.health.v1.Health", "Check", HashMap::new());
         assert!(!filter.should_record(&health_ctx));
 
         // Other services should be included
@@ -318,8 +313,7 @@ mod tests {
         assert!(filter.should_record(&ctx1));
 
         // Matching service but non-matching method should be excluded
-        let ctx2 =
-            FilterContext::grpc("hyperswitch.PaymentService", "GetPayment", HashMap::new());
+        let ctx2 = FilterContext::grpc("hyperswitch.PaymentService", "GetPayment", HashMap::new());
         assert!(!filter.should_record(&ctx2));
 
         // Non-matching service should be excluded

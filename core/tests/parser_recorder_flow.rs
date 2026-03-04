@@ -44,7 +44,8 @@ async fn test_http_parse_and_record() -> Result<(), Box<dyn std::error::Error>> 
 
     // 6. Verify Disk Storage
     // Events are stored in binary format at sessions/{session_id}/events.bin
-    let events_path = temp_dir.path()
+    let events_path = temp_dir
+        .path()
         .join("sessions")
         .join(&session_id)
         .join("events.bin");

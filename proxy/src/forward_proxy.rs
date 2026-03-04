@@ -12,7 +12,9 @@
 
 use crate::correlation::TraceCorrelator;
 use deja_common::ScopeId;
-use deja_core::events::{recorded_event, EventDirection, HttpRequestEvent, HttpResponseEvent, RecordedEvent};
+use deja_core::events::{
+    recorded_event, EventDirection, HttpRequestEvent, HttpResponseEvent, RecordedEvent,
+};
 use deja_core::recording::Recorder;
 use deja_core::replay::ReplayEngine;
 use deja_core::tls_mitm::TlsMitmManager;
@@ -55,9 +57,15 @@ pub async fn start_forward_proxy(
                 let peer_port = peer_addr.port();
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_forward_proxy_connection(client_socket, peer_port, tls_mgr, rec, rep, corr)
-                            .await
+                    if let Err(e) = handle_forward_proxy_connection(
+                        client_socket,
+                        peer_port,
+                        tls_mgr,
+                        rec,
+                        rep,
+                        corr,
+                    )
+                    .await
                     {
                         error!("[ForwardProxy] Connection error: {}", e);
                     }
@@ -313,7 +321,9 @@ async fn handle_tls_tunnel(
                         let mut scope_guard = conn_scope_clone.lock().await;
                         let request_trace = header_map.get("x-trace-id").cloned();
 
-                        if let Some((existing_trace, existing_scope)) = scope_guard.as_ref().cloned() {
+                        if let Some((existing_trace, existing_scope)) =
+                            scope_guard.as_ref().cloned()
+                        {
                             if let Some(ref requested_trace) = request_trace {
                                 if requested_trace != &existing_trace {
                                     let new_scope = correlator_clone
@@ -325,7 +335,8 @@ async fn handle_tls_tunnel(
                                         new_scope_id = %new_scope,
                                         "[ForwardProxy] Updating keep-alive tunnel association"
                                     );
-                                    *scope_guard = Some((requested_trace.clone(), new_scope.clone()));
+                                    *scope_guard =
+                                        Some((requested_trace.clone(), new_scope.clone()));
                                     (requested_trace.clone(), new_scope)
                                 } else {
                                     (existing_trace, existing_scope)
@@ -334,7 +345,8 @@ async fn handle_tls_tunnel(
                                 (existing_trace, existing_scope)
                             }
                         } else {
-                            let tid = request_trace.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let tid =
+                                request_trace.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                             let sid = correlator_clone.allocate_connection_id(&tid).await;
                             debug!(
                                 trace_id = %tid,
@@ -368,9 +380,7 @@ async fn handle_tls_tunnel(
                     let body = request_buf[head_len..total_len].to_vec();
 
                     // Get sequence number within this connection scope
-                    let sequence = correlator_clone
-                        .next_scope_sequence(&scope_id)
-                        .await;
+                    let sequence = correlator_clone.next_scope_sequence(&scope_id).await;
 
                     // Create event
                     let event = RecordedEvent {
@@ -514,9 +524,7 @@ async fn handle_tls_tunnel(
                         };
 
                         // Get sequence number
-                        let sequence = correlator_clone2
-                            .next_scope_sequence(&scope_id)
-                            .await;
+                        let sequence = correlator_clone2.next_scope_sequence(&scope_id).await;
 
                         let event = RecordedEvent {
                             trace_id,

@@ -205,13 +205,34 @@ async fn test_stream_scoped_replay_matches_correct_stream() {
     // Stream 5: Request C, Response C
     let events = vec![
         // Stream 1 first
-        create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:1", 1, "MyService", "MethodA", 0),
+        create_grpc_request(
+            "trace-1",
+            "trace:trace-1:conn:0:stream:1",
+            1,
+            "MyService",
+            "MethodA",
+            0,
+        ),
         create_grpc_response("trace-1", "trace:trace-1:conn:0:stream:1", 1, 0, 1),
         // Stream 3 second
-        create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:3", 3, "MyService", "MethodB", 0),
+        create_grpc_request(
+            "trace-1",
+            "trace:trace-1:conn:0:stream:3",
+            3,
+            "MyService",
+            "MethodB",
+            0,
+        ),
         create_grpc_response("trace-1", "trace:trace-1:conn:0:stream:3", 3, 0, 1),
         // Stream 5 third
-        create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:5", 5, "MyService", "MethodC", 0),
+        create_grpc_request(
+            "trace-1",
+            "trace:trace-1:conn:0:stream:5",
+            5,
+            "MyService",
+            "MethodC",
+            0,
+        ),
         create_grpc_response("trace-1", "trace:trace-1:conn:0:stream:5", 5, 0, 1),
     ];
 
@@ -228,14 +249,24 @@ async fn test_stream_scoped_replay_matches_correct_stream() {
     let mut engine = ReplayEngine::new(events_file).await.unwrap();
 
     // Replaying stream 3 should match stream 3's request, not stream 1 or 5
-    let stream3_incoming = create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:3", 3, "MyService", "MethodB", 999);
+    let stream3_incoming = create_grpc_request(
+        "trace-1",
+        "trace:trace-1:conn:0:stream:3",
+        3,
+        "MyService",
+        "MethodB",
+        999,
+    );
 
     let (matched, response_events, _response_bytes) =
         engine.find_match_with_responses(&stream3_incoming).unwrap();
 
     // Verify matched event is from stream 3
     if let Some(recorded_event::Event::GrpcRequest(req)) = &matched.event {
-        assert_eq!(req.stream_id, 3, "Should match stream 3, not another stream");
+        assert_eq!(
+            req.stream_id, 3,
+            "Should match stream 3, not another stream"
+        );
         assert_eq!(req.method, "MethodB");
     } else {
         panic!("Expected gRPC request");
@@ -243,7 +274,14 @@ async fn test_stream_scoped_replay_matches_correct_stream() {
     assert_eq!(response_events.len(), 1);
 
     // Verify that stream 1 still works after stream 3 match
-    let stream1_incoming = create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:1", 1, "MyService", "MethodA", 999);
+    let stream1_incoming = create_grpc_request(
+        "trace-1",
+        "trace:trace-1:conn:0:stream:1",
+        1,
+        "MyService",
+        "MethodA",
+        999,
+    );
     let (matched1, _, _) = engine.find_match_with_responses(&stream1_incoming).unwrap();
     if let Some(recorded_event::Event::GrpcRequest(req)) = &matched1.event {
         assert_eq!(req.stream_id, 1, "Should match stream 1");
@@ -259,7 +297,14 @@ async fn test_replay_rejects_orphan_stream_without_scope_binding() {
 
     // Create a recording with proper stream scope
     let events = vec![
-        create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:1", 1, "MyService", "MethodA", 0),
+        create_grpc_request(
+            "trace-1",
+            "trace:trace-1:conn:0:stream:1",
+            1,
+            "MyService",
+            "MethodA",
+            0,
+        ),
         create_grpc_response("trace-1", "trace:trace-1:conn:0:stream:1", 1, 0, 1),
     ];
 
@@ -276,7 +321,14 @@ async fn test_replay_rejects_orphan_stream_without_scope_binding() {
     let mut engine = ReplayEngine::new(events_file).await.unwrap();
 
     // Try to replay with orphan trace_id (no scope binding)
-    let orphan_request = create_grpc_request("orphan", "trace:orphan:conn:0:stream:1", 1, "MyService", "MethodA", 0);
+    let orphan_request = create_grpc_request(
+        "orphan",
+        "trace:orphan:conn:0:stream:1",
+        1,
+        "MyService",
+        "MethodA",
+        0,
+    );
 
     // Should fail with UnresolvedAttribution error (fail-closed)
     let result = engine.find_match_with_responses_typed(&orphan_request);
@@ -301,7 +353,14 @@ async fn test_replay_rejects_empty_scope_id() {
     let events_file = temp_dir.path().join("events.jsonl");
 
     let events = vec![
-        create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:1", 1, "MyService", "MethodA", 0),
+        create_grpc_request(
+            "trace-1",
+            "trace:trace-1:conn:0:stream:1",
+            1,
+            "MyService",
+            "MethodA",
+            0,
+        ),
         create_grpc_response("trace-1", "trace:trace-1:conn:0:stream:1", 1, 0, 1),
     ];
 
@@ -344,10 +403,24 @@ async fn test_concurrent_stream_replay_isolation() {
     // Create recordings for two traces with same stream IDs (different connections)
     let events = vec![
         // Trace A: Stream 1
-        create_grpc_request("trace-a", "trace:trace-a:conn:0:stream:1", 1, "Service", "Method", 0),
+        create_grpc_request(
+            "trace-a",
+            "trace:trace-a:conn:0:stream:1",
+            1,
+            "Service",
+            "Method",
+            0,
+        ),
         create_grpc_response("trace-a", "trace:trace-a:conn:0:stream:1", 1, 0, 1),
         // Trace B: Stream 1 (same stream ID, different trace)
-        create_grpc_request("trace-b", "trace:trace-b:conn:0:stream:1", 1, "Service", "Method", 0),
+        create_grpc_request(
+            "trace-b",
+            "trace:trace-b:conn:0:stream:1",
+            1,
+            "Service",
+            "Method",
+            0,
+        ),
         create_grpc_response("trace-b", "trace:trace-b:conn:0:stream:1", 1, 0, 1),
     ];
 
@@ -364,14 +437,28 @@ async fn test_concurrent_stream_replay_isolation() {
     let mut engine = ReplayEngine::new(events_file).await.unwrap();
 
     // Replay trace-a stream 1
-    let trace_a_stream1 = create_grpc_request("trace-a", "trace:trace-a:conn:0:stream:1", 1, "Service", "Method", 0);
+    let trace_a_stream1 = create_grpc_request(
+        "trace-a",
+        "trace:trace-a:conn:0:stream:1",
+        1,
+        "Service",
+        "Method",
+        0,
+    );
     let (matched_a, _, _) = engine.find_match_with_responses(&trace_a_stream1).unwrap();
     if let Some(recorded_event::Event::GrpcRequest(req)) = &matched_a.event {
         assert_eq!(req.stream_id, 1);
     }
 
     // Replay trace-b stream 1 - should match trace-b's recording, not trace-a's
-    let trace_b_stream1 = create_grpc_request("trace-b", "trace:trace-b:conn:0:stream:1", 1, "Service", "Method", 0);
+    let trace_b_stream1 = create_grpc_request(
+        "trace-b",
+        "trace:trace-b:conn:0:stream:1",
+        1,
+        "Service",
+        "Method",
+        0,
+    );
     let (matched_b, _, _) = engine.find_match_with_responses(&trace_b_stream1).unwrap();
     if let Some(recorded_event::Event::GrpcRequest(req)) = &matched_b.event {
         assert_eq!(req.stream_id, 1);
@@ -395,9 +482,30 @@ async fn test_interleaved_stream_ordering_within_scope() {
     // Stream 3: Response (seq 1)
     // Stream 5: Response (seq 1)
     let events = vec![
-        create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:1", 1, "Service", "MethodA", 0),
-        create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:3", 3, "Service", "MethodB", 0),
-        create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:5", 5, "Service", "MethodC", 0),
+        create_grpc_request(
+            "trace-1",
+            "trace:trace-1:conn:0:stream:1",
+            1,
+            "Service",
+            "MethodA",
+            0,
+        ),
+        create_grpc_request(
+            "trace-1",
+            "trace:trace-1:conn:0:stream:3",
+            3,
+            "Service",
+            "MethodB",
+            0,
+        ),
+        create_grpc_request(
+            "trace-1",
+            "trace:trace-1:conn:0:stream:5",
+            5,
+            "Service",
+            "MethodC",
+            0,
+        ),
         create_grpc_response("trace-1", "trace:trace-1:conn:0:stream:1", 1, 0, 1),
         create_grpc_response("trace-1", "trace:trace-1:conn:0:stream:3", 3, 0, 1),
         create_grpc_response("trace-1", "trace:trace-1:conn:0:stream:5", 5, 0, 1),
@@ -417,12 +525,26 @@ async fn test_interleaved_stream_ordering_within_scope() {
 
     // Each stream should have independent sequence progression
     // Stream 1: request (seq 0), response (seq 1)
-    let s1_req = create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:1", 1, "Service", "MethodA", 0);
+    let s1_req = create_grpc_request(
+        "trace-1",
+        "trace:trace-1:conn:0:stream:1",
+        1,
+        "Service",
+        "MethodA",
+        0,
+    );
     let (matched, _, _) = engine.find_match_with_responses(&s1_req).unwrap();
     assert_eq!(matched.scope_sequence, 0);
 
     // Stream 5: request (seq 0) - should still be seq 0 even though other streams progressed
-    let s5_req = create_grpc_request("trace-1", "trace:trace-1:conn:0:stream:5", 5, "Service", "MethodC", 0);
+    let s5_req = create_grpc_request(
+        "trace-1",
+        "trace:trace-1:conn:0:stream:5",
+        5,
+        "Service",
+        "MethodC",
+        0,
+    );
     let (matched5, _, _) = engine.find_match_with_responses(&s5_req).unwrap();
     assert_eq!(matched5.scope_sequence, 0);
     assert_eq!(matched5.scope_id, "trace:trace-1:conn:0:stream:5");

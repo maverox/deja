@@ -1,13 +1,10 @@
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use deja_sdk::{
     association::{associate_pg_connection, associate_redis_connection},
-    deja_run, generate_trace_id, get_runtime, reqwest::DejaClient, spawn_with_task_id,
-    with_trace_context, ControlMessage,
-    DejaAsyncBoundary, DejaRuntime,
+    deja_run, generate_trace_id, get_runtime,
+    reqwest::DejaClient,
+    spawn_with_task_id, with_trace_context, ControlMessage, DejaRuntime,
 };
-
-
-
 
 use serde::{Deserialize, Serialize};
 use sqlx::Connection;
@@ -90,7 +87,9 @@ pub async fn process_handler(
     info!(trace_id = %trace_id, "Processing HTTP request");
 
     deja_sdk::with_trace_id(trace_id.clone(), async move {
-        let generated_uuid = deja_run(&*runtime, "uuid", || Uuid::new_v4()).await.to_string();
+        let generated_uuid = deja_run(&*runtime, "uuid", || Uuid::new_v4())
+            .await
+            .to_string();
         let timestamp_ms = deja_run(&*runtime, "time", || {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -99,17 +98,32 @@ pub async fn process_handler(
         })
         .await;
 
-        let http_result = match do_http_work(&state.http_client, state.proxy_http_port, &trace_id).await {
-            Ok(res) => res,
-            Err(e) => format!("HTTP Error: {}", e),
-        };
+        let http_result =
+            match do_http_work(&state.http_client, state.proxy_http_port, &trace_id).await {
+                Ok(res) => res,
+                Err(e) => format!("HTTP Error: {}", e),
+            };
 
-        let redis_result = match do_redis_work(&state.pools, &trace_id, body.id.as_deref().unwrap_or("http"), &body.data).await {
+        let redis_result = match do_redis_work(
+            &state.pools,
+            &trace_id,
+            body.id.as_deref().unwrap_or("http"),
+            &body.data,
+        )
+        .await
+        {
             Ok(res) => res,
             Err(e) => format!("Redis Error: {}", e),
         };
 
-        let pg_result = match do_pg_work(&state.pg_url, &trace_id, body.id.as_deref().unwrap_or("http"), &body.data).await {
+        let pg_result = match do_pg_work(
+            &state.pg_url,
+            &trace_id,
+            body.id.as_deref().unwrap_or("http"),
+            &body.data,
+        )
+        .await
+        {
             Ok(res) => res,
             Err(e) => format!("PG Error: {}", e),
         };
@@ -122,7 +136,8 @@ pub async fn process_handler(
                 let _ = deja_sdk::with_trace_id(tid.clone(), async move {
                     let _bg_uuid = deja_run(&*rt_clone, "bg_uuid", || Uuid::new_v4()).await;
                     info!(trace_id = %tid, "Generated background UUID: {}", _bg_uuid);
-                }).await;
+                })
+                .await;
             }
         });
 
@@ -208,8 +223,20 @@ pub async fn correlation_torture_handler(
                     &trace_for_worker,
                 )
                 .await;
-                let _ = do_redis_work(&state_ref.pools, &trace_for_worker, &worker_id, &worker_data).await;
-                let _ = do_pg_work(&state_ref.pg_url, &trace_for_worker, &worker_id, &worker_data).await;
+                let _ = do_redis_work(
+                    &state_ref.pools,
+                    &trace_for_worker,
+                    &worker_id,
+                    &worker_data,
+                )
+                .await;
+                let _ = do_pg_work(
+                    &state_ref.pg_url,
+                    &trace_for_worker,
+                    &worker_id,
+                    &worker_data,
+                )
+                .await;
                 true
             });
 
@@ -276,11 +303,6 @@ async fn do_redis_work(
 
     let key = format!("http:{}:{}", id, trace_id);
 
-
-
-
-
-
     let _: () = redis::cmd("SET")
         .arg(&key)
         .arg(data)
@@ -307,12 +329,11 @@ async fn do_pg_work(
         .execute(&mut conn)
         .await?;
 
-
-
-
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS http_logs (id TEXT PRIMARY KEY, data TEXT, trace_id TEXT)")
-        .execute(&mut conn).await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS http_logs (id TEXT PRIMARY KEY, data TEXT, trace_id TEXT)",
+    )
+    .execute(&mut conn)
+    .await?;
 
     sqlx::query("INSERT INTO http_logs (id, data, trace_id) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET data = $2")
         .bind(id).bind(data).bind(trace_id)

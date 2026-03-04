@@ -11,7 +11,6 @@
 use crate::correlation::{ControlOrderingDecision, TraceCorrelator};
 use bytes::Bytes;
 use deja_common::{ControlMessage, ScopeId};
-use tracing::debug;
 use deja_core::events::{
     non_deterministic_event, recorded_event, EventDirection, NonDeterministicEvent, RecordedEvent,
 };
@@ -27,6 +26,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tracing::debug;
 
 /// Request body for /capture endpoint
 #[derive(Debug, Deserialize)]
@@ -680,7 +680,11 @@ async fn apply_control_message(state: Arc<ControlApiState>, message: ControlMess
                 .await;
             create_control_success_response()
         }
-        ControlMessage::PoolReturn { trace_id, source_port, .. } => {
+        ControlMessage::PoolReturn {
+            trace_id,
+            source_port,
+            ..
+        } => {
             debug!(
                 trace_id = %trace_id,
                 source_port = source_port,
@@ -775,13 +779,7 @@ fn create_control_error_response(message: &str) -> String {
 }
 
 fn create_non_deterministic_event(req: &CaptureRequest) -> Result<RecordedEvent, String> {
-    create_non_deterministic_event_with_seq(
-        &req.trace_id,
-        None,
-        &req.kind,
-        req.seq,
-        &req.value,
-    )
+    create_non_deterministic_event_with_seq(&req.trace_id, None, &req.kind, req.seq, &req.value)
 }
 
 fn create_non_deterministic_event_with_seq(
@@ -792,7 +790,9 @@ fn create_non_deterministic_event_with_seq(
     value: &str,
 ) -> Result<RecordedEvent, String> {
     let nd_kind = match kind {
-        "uuid" | "uuid_v7" => Some(non_deterministic_event::Kind::UuidCapture(value.to_string())),
+        "uuid" | "uuid_v7" => Some(non_deterministic_event::Kind::UuidCapture(
+            value.to_string(),
+        )),
         "time" => {
             let ns: u64 = value
                 .parse()
@@ -809,11 +809,13 @@ fn create_non_deterministic_event_with_seq(
             value.to_string(),
         )),
         "random_bytes" => {
-            let bytes =
-                hex::decode(value).map_err(|_| format!("Invalid hex for random_bytes: {}", value))?;
+            let bytes = hex::decode(value)
+                .map_err(|_| format!("Invalid hex for random_bytes: {}", value))?;
             Some(non_deterministic_event::Kind::RandomBytesCapture(bytes))
         }
-        "nanoid" => Some(non_deterministic_event::Kind::NanoidCapture(value.to_string())),
+        "nanoid" => Some(non_deterministic_event::Kind::NanoidCapture(
+            value.to_string(),
+        )),
         _ => Some(non_deterministic_event::Kind::UuidCapture(format!(
             "{}:{}",
             kind, value
@@ -865,7 +867,10 @@ mod tests {
     #[tokio::test]
     async fn control_message_ordering_duplicate_pool_checkout_is_idempotent() {
         let state = test_state();
-        state.correlator.start_trace("trace-dup".to_string(), 1).await;
+        state
+            .correlator
+            .start_trace("trace-dup".to_string(), 1)
+            .await;
 
         let message = ControlMessage::PoolCheckout {
             trace_id: "trace-dup".to_string(),
@@ -893,7 +898,10 @@ mod tests {
     #[tokio::test]
     async fn control_message_ordering_rejects_stale_sequence() {
         let state = test_state();
-        state.correlator.start_trace("trace-stale".to_string(), 1).await;
+        state
+            .correlator
+            .start_trace("trace-stale".to_string(), 1)
+            .await;
 
         let accepted = apply_control_message(
             state.clone(),
@@ -926,7 +934,10 @@ mod tests {
     #[tokio::test]
     async fn control_message_ordering_rejects_out_of_order_sequence_deterministically() {
         let state = test_state();
-        state.correlator.start_trace("trace-order".to_string(), 1).await;
+        state
+            .correlator
+            .start_trace("trace-order".to_string(), 1)
+            .await;
 
         let seq1 = apply_control_message(
             state.clone(),

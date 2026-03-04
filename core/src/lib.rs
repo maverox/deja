@@ -9,8 +9,8 @@ pub mod storage;
 pub mod tls_mitm;
 
 // Re-export trace context and spawning functions for easy access
-pub use runtime::spawn::{spawn, spawn_blocking, get_blocking_trace_id};
 pub use runtime::pool_interceptor::InterceptedConnection;
+pub use runtime::spawn::{get_blocking_trace_id, spawn, spawn_blocking};
 
 // Re-export generated protobuf modules
 pub mod proto {

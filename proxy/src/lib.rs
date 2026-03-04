@@ -6,5 +6,5 @@ pub mod buffer;
 pub mod correlation;
 
 // Re-export commonly used types
-pub use correlation::TraceCorrelator;
 pub use buffer::{PendingEventBuffer, QuarantinedEvents};
+pub use correlation::TraceCorrelator;

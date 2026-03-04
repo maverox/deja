@@ -196,8 +196,7 @@ mod tests {
     #[tokio::test]
     async fn test_intercepted_connection_deref_mut() {
         let mock = MockConnection::new("conn-2".to_string());
-        let mut intercepted =
-            InterceptedConnection::new(mock, None, "127.0.0.1:5432".to_string());
+        let mut intercepted = InterceptedConnection::new(mock, None, "127.0.0.1:5432".to_string());
 
         // Should be able to mutate through DerefMut
         intercepted.execute("SELECT 1").await;
@@ -217,11 +216,7 @@ mod tests {
     #[tokio::test]
     async fn test_intercepted_connection_id() {
         let mock = MockConnection::new("conn-4".to_string());
-        let intercepted = InterceptedConnection::new(
-            mock,
-            None,
-            "127.0.0.1:5433".to_string(),
-        );
+        let intercepted = InterceptedConnection::new(mock, None, "127.0.0.1:5433".to_string());
 
         assert_eq!(intercepted.connection_id(), "127.0.0.1:5433");
     }

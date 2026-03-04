@@ -93,12 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let correlator = Arc::new(correlation::TraceCorrelator::new());
     tracing::info!("[Correlation] Initialized scope-based trace correlator");
 
-let association_timeout_ms: u64 = std::env::var("DEJA_ASSOCIATION_TIMEOUT_MS")
+    let association_timeout_ms: u64 = std::env::var("DEJA_ASSOCIATION_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(args.association_timeout_ms);
 
-    let retro_bind_window_ms: u64 = std::env::var("DEJA_RETRO_BIND_WINDOW_MS")
+    let _retro_bind_window_ms: u64 = std::env::var("DEJA_RETRO_BIND_WINDOW_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(args.retro_bind_window_ms);
@@ -110,12 +110,19 @@ let association_timeout_ms: u64 = std::env::var("DEJA_ASSOCIATION_TIMEOUT_MS")
         Ok(_) | Err(_) => args.replay_strict_mode == "strict",
     };
 
-    tracing::info!("[Config] Replay strict mode: {}", if is_replay_strict { "strict (fail-closed)" } else { "lenient (fail-open)" });
+    tracing::info!(
+        "[Config] Replay strict mode: {}",
+        if is_replay_strict {
+            "strict (fail-closed)"
+        } else {
+            "lenient (fail-open)"
+        }
+    );
 
-    let storage_backend = std::env::var("DEJA_STORAGE_BACKEND")
-        .unwrap_or_else(|_| args.storage_backend.clone());
-    let kafka_brokers = std::env::var("DEJA_KAFKA_BROKERS")
-        .unwrap_or_else(|_| args.kafka_brokers.clone());
+    let storage_backend =
+        std::env::var("DEJA_STORAGE_BACKEND").unwrap_or_else(|_| args.storage_backend.clone());
+    let kafka_brokers =
+        std::env::var("DEJA_KAFKA_BROKERS").unwrap_or_else(|_| args.kafka_brokers.clone());
     let kafka_topic_prefix = std::env::var("DEJA_KAFKA_TOPIC_PREFIX")
         .unwrap_or_else(|_| args.kafka_topic_prefix.clone());
 
@@ -127,7 +134,9 @@ let association_timeout_ms: u64 = std::env::var("DEJA_ASSOCIATION_TIMEOUT_MS")
         },
         _ => deja_common::StorageConfig::LocalFile {
             base_path: record_dir.clone(),
-            format: Some(std::env::var("DEJA_STORAGE_FORMAT").unwrap_or_else(|_| "binary".to_string())),
+            format: Some(
+                std::env::var("DEJA_STORAGE_FORMAT").unwrap_or_else(|_| "binary".to_string()),
+            ),
         },
     };
     tracing::info!("Storage backend: {:?}", storage_config);
@@ -233,10 +242,7 @@ let association_timeout_ms: u64 = std::env::var("DEJA_ASSOCIATION_TIMEOUT_MS")
             let replay_engine_clone = replay_engine.clone();
             let correlator_clone = correlator.clone();
 
-            tracing::info!(
-                "[ForwardProxy] Starting forward proxy on port {}",
-                fwd_port
-            );
+            tracing::info!("[ForwardProxy] Starting forward proxy on port {}", fwd_port);
 
             tasks.push(tokio::spawn(async move {
                 if let Err(e) = forward_proxy::start_forward_proxy(
@@ -301,10 +307,7 @@ let association_timeout_ms: u64 = std::env::var("DEJA_ASSOCIATION_TIMEOUT_MS")
             None
         } else {
             if replay_engine.is_some() {
-                tracing::info!(
-                    "[{}] Setting up listener with REPLAY ENABLED",
-                    listen_port
-                );
+                tracing::info!("[{}] Setting up listener with REPLAY ENABLED", listen_port);
             }
             replay_engine.clone()
         };
@@ -357,7 +360,8 @@ let association_timeout_ms: u64 = std::env::var("DEJA_ASSOCIATION_TIMEOUT_MS")
                             }
 
                             // Plain connection
-                            let detected_parser = connection::detect_protocol(&client_socket, &ps).await;
+                            let detected_parser =
+                                connection::detect_protocol(&client_socket, &ps).await;
                             if let Err(e) = connection::handle_connection(
                                 client_socket,
                                 target,
