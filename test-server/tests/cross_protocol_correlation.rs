@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tonic::Request;
 
 pub mod connector {

@@ -71,11 +71,7 @@ pub async fn process_handler(
     let control_client = runtime.control_client();
 
     let trace_id = if let Some(id) = &body.id {
-        let id = id.clone();
-        control_client
-            .send_best_effort(ControlMessage::start_trace(&id))
-            .await;
-        id
+        id.clone()
     } else {
         req.headers()
             .get("x-trace-id")
@@ -86,7 +82,12 @@ pub async fn process_handler(
 
     info!(trace_id = %trace_id, "Processing HTTP request");
 
-    deja_sdk::with_trace_id(trace_id.clone(), async move {
+    with_trace_context(trace_id.clone(), async move {
+        let task_id = deja_sdk::current_task_id().unwrap_or_else(|| "0".to_string());
+        control_client
+            .send_best_effort(ControlMessage::start_trace_with_task(&trace_id, &task_id))
+            .await;
+
         let generated_uuid = deja_run(&*runtime, "uuid", || Uuid::new_v4())
             .await
             .to_string();
@@ -130,21 +131,15 @@ pub async fn process_handler(
 
         let rt_clone = runtime.clone();
         let trace_id_for_bg = trace_id.clone();
-        let _ = deja_sdk::spawn_traced({
-            let tid = trace_id_for_bg.clone();
-            async move {
-                let _ = deja_sdk::with_trace_id(tid.clone(), async move {
-                    let _bg_uuid = deja_run(&*rt_clone, "bg_uuid", || Uuid::new_v4()).await;
-                    info!(trace_id = %tid, "Generated background UUID: {}", _bg_uuid);
-                })
-                .await;
-            }
+        let _ = deja_sdk::spawn_traced(async move {
+            let bg_uuid = deja_run(&*rt_clone, "bg_uuid", || Uuid::new_v4()).await;
+            info!(trace_id = %trace_id_for_bg, "Generated background UUID: {}", bg_uuid);
         });
 
         runtime.flush().await;
 
         control_client
-            .send_best_effort(ControlMessage::end_trace(&trace_id))
+            .send_best_effort(ControlMessage::end_trace_with_task(&trace_id, &task_id))
             .await;
 
         HttpResponse::Ok().json(ProcessResponse {
@@ -192,11 +187,12 @@ pub async fn correlation_torture_handler(
 
     let workers = body.workers.unwrap_or(4).clamp(2, 12);
 
-    control_client
-        .send_best_effort(ControlMessage::start_trace(&trace_id))
-        .await;
-
     with_trace_context(trace_id.clone(), async move {
+        let task_id = deja_sdk::current_task_id().unwrap_or_else(|| "0".to_string());
+        control_client
+            .send_best_effort(ControlMessage::start_trace_with_task(&trace_id, &task_id))
+            .await;
+
         let mut handles = Vec::with_capacity(workers);
         let mut task_ids = Vec::with_capacity(workers);
 
@@ -247,11 +243,9 @@ pub async fn correlation_torture_handler(
         let runtime_for_bg = runtime.clone();
         let bg_trace = trace_id.clone();
         let _ = deja_sdk::spawn_traced(async move {
-            let _ = with_trace_context(bg_trace.clone(), async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                let _ = deja_run(&*runtime_for_bg, "bg_uuid", || Uuid::new_v4()).await;
-            })
-            .await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let _ = deja_run(&*runtime_for_bg, "bg_uuid", || Uuid::new_v4()).await;
+            info!(trace_id = %bg_trace, "Generated background UUID in torture handler");
         });
 
         let mut completed_workers = 0usize;
@@ -264,7 +258,7 @@ pub async fn correlation_torture_handler(
         runtime.flush().await;
 
         control_client
-            .send_best_effort(ControlMessage::end_trace(&trace_id))
+            .send_best_effort(ControlMessage::end_trace_with_task(&trace_id, &task_id))
             .await;
 
         HttpResponse::Ok().json(CorrelationTortureResponse {

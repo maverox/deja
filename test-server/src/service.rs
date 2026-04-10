@@ -12,7 +12,7 @@ use crate::test_service::{
     EchoRequest, EchoResponse, GenerateIdRequest, GenerateIdResponse, MultiBackendRequest,
     MultiBackendResponse, Scenario,
 };
-use deja_sdk::{deja_run, get_runtime};
+use deja_sdk::{current_trace_id, deja_run, get_runtime};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
@@ -36,6 +36,7 @@ impl TestServiceImpl {
             .get("x-trace-id")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
+            .or_else(current_trace_id)
     }
 }
 

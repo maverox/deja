@@ -1,6 +1,6 @@
 use actix_web::{web, App, HttpServer};
 use clap::Parser;
-use deja_sdk::reqwest::DejaClient;
+use deja_sdk::{reqwest::DejaClient, tonic::DejaTonicLayer};
 use std::net::SocketAddr;
 use test_server::{
     connector::connector_server::ConnectorServer,
@@ -145,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("🌐 Connector gRPC server listening on {}", addr);
 
         TonicServer::builder()
+            .layer(DejaTonicLayer::default())
             .add_service(ConnectorServer::new(connector_service))
             .serve(addr)
             .await
@@ -169,6 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         result = TonicServer::builder()
+            .layer(DejaTonicLayer::default())
             .add_service(TestServiceServer::new(test_service))
             .serve(test_service_addr) => {
             if let Err(e) = result {

@@ -76,14 +76,20 @@ async fn test_http_recording_scope_fields() {
     }
 
     // Send 3 HTTP requests through the proxy
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
     for endpoint in &["/echo", "/health", "/random"] {
-        let _ = client
+        let response = client
             .get(format!("{}{}", harness.proxy_url(), endpoint))
             .send()
-            .await;
+            .await
+            .expect("HTTP request through proxy should succeed");
+        let _ = response.bytes().await;
         sleep(Duration::from_millis(50)).await;
     }
+    drop(client);
 
     // Flush
     sleep(Duration::from_millis(1000)).await;
@@ -412,12 +418,17 @@ async fn test_direction_field_correctness() {
         }
     }
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
     let resp = client
         .get(format!("{}/echo", harness.proxy_url()))
         .send()
         .await;
     assert!(resp.is_ok(), "HTTP request through proxy should succeed");
+    let _ = resp.unwrap().bytes().await;
+    drop(client);
 
     sleep(Duration::from_millis(1000)).await;
     harness.stop_proxy();

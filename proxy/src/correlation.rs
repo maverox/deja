@@ -8,7 +8,7 @@ use deja_common::{ConnectionKey, Protocol, ScopeId, ScopeSequenceTracker};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlOrderingDecision {
@@ -147,6 +147,9 @@ pub struct TraceCorrelator {
     /// Pending event buffers for retro-binding (record mode)
     pending_event_buffers: Arc<RwLock<HashMap<u16, PendingEventBuffer>>>,
 
+    /// Concrete associations for live connections, including late-bound ones.
+    live_associations: Arc<RwLock<HashMap<u16, ConnectionAssociation>>>,
+
     /// Quarantined events that couldn't be attributed
     quarantined_events: Arc<RwLock<QuarantinedEvents>>,
 
@@ -185,6 +188,7 @@ impl TraceCorrelator {
             metrics: Arc::new(RwLock::new(CorrelationMetrics::default())),
             control_ordering: Arc::new(RwLock::new(HashMap::new())),
             pending_event_buffers: Arc::new(RwLock::new(HashMap::new())),
+            live_associations: Arc::new(RwLock::new(HashMap::new())),
             quarantined_events: Arc::new(RwLock::new(QuarantinedEvents::new())),
             outgoing_to_peer_port: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -689,10 +693,11 @@ impl TraceCorrelator {
         // Check pending connections matching this source port (O(1) lookup)
         let pending_connection = self.pending_connections.write().await.remove(&source_port);
         let mut lease_state = LeaseLifecycleState::Associated;
+        let mut live_assoc = None;
 
         if let Some(pc) = pending_connection {
             let assoc = self.create_association(trace_id, protocol).await;
-            if pc.sender.send(assoc).is_ok() {
+            if pc.sender.send(assoc.clone()).is_ok() {
                 lease_state = LeaseLifecycleState::Leased;
                 self.metrics
                     .write()
@@ -704,44 +709,33 @@ impl TraceCorrelator {
                     .await
                     .late_binds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                live_assoc = Some(assoc);
             } else {
                 warn!(
                     source_port = source_port,
                     trace_id = %trace_id,
                     "Pending association receiver dropped; pre-registering for next connection"
                 );
+                live_assoc = Some(assoc);
+                lease_state = LeaseLifecycleState::Leased;
             }
+        } else if self
+            .pending_event_buffers
+            .read()
+            .await
+            .get(&source_port)
+            .map(|buffer| buffer.has_events(source_port))
+            .unwrap_or(false)
+        {
+            live_assoc = Some(self.create_association(trace_id, protocol).await);
+            lease_state = LeaseLifecycleState::Leased;
         }
 
-        // Flush any buffered events for retro-binding
-        let scope_id =
-            ScopeId::connection(trace_id, self.get_connection_index(trace_id).await as u64);
-        let flushed = self
-            .flush_buffered_events_on_bind(source_port, &scope_id, trace_id)
-            .await;
-        if !flushed.is_empty() {
-            info!(
-                source_port = source_port,
-                trace_id = %trace_id,
-                count = flushed.len(),
-                "Retro-bound buffered events to trace"
-            );
-        }
-
-        let expired = self.quarantine_expired_events(source_port).await;
-        if !expired.is_empty() {
-            let count = expired.len();
-            self.add_to_quarantine(source_port, expired).await;
-            self.metrics
+        if let Some(assoc) = live_assoc.clone() {
+            self.live_associations
                 .write()
                 .await
-                .quarantine_events
-                .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
-            info!(
-                source_port = source_port,
-                count = count,
-                "Expired buffered events moved to quarantine"
-            );
+                .insert(source_port, assoc);
         }
 
         // Pre-register for future connection using source-port-only key
@@ -756,6 +750,28 @@ impl TraceCorrelator {
         );
         self.validate_invariants_after_transition(source_port, "associate_by_source_port")
             .await;
+    }
+
+    pub async fn register_live_association(
+        &self,
+        source_port: u16,
+        association: ConnectionAssociation,
+    ) {
+        self.live_associations
+            .write()
+            .await
+            .insert(source_port, association);
+    }
+
+    pub async fn lookup_live_association(
+        &self,
+        source_port: u16,
+    ) -> Option<ConnectionAssociation> {
+        self.live_associations.read().await.get(&source_port).cloned()
+    }
+
+    pub async fn clear_live_association(&self, source_port: u16) {
+        self.live_associations.write().await.remove(&source_port);
     }
 
     async fn get_connection_index(&self, trace_id: &str) -> u32 {

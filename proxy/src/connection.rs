@@ -201,10 +201,86 @@ async fn resolve_association(
 
 /// Process client events: enrich, record, and replay-match
 /// In record mode with unresolved (orphan) association, buffers events for retro-binding
-/// until the retro-bind window elapses; after that, events fall through and are recorded as orphan.
+/// and only persists them once the connection is either late-bound or finally orphaned.
+async fn persist_buffered_events(
+    events: Vec<(RecordedEvent, EventDirection)>,
+    scope_id: &ScopeId,
+    trace_id: &str,
+    correlator: &TraceCorrelator,
+    recorder: &Arc<Recorder>,
+) {
+    for (mut event, direction) in events {
+        if let Some(stream_id) = extract_stream_id(&event) {
+            enrich_stream_event(
+                &mut event,
+                scope_id,
+                stream_id,
+                trace_id,
+                direction,
+                correlator,
+            )
+            .await;
+        } else {
+            enrich_event(&mut event, scope_id, trace_id, direction, correlator).await;
+        }
+
+        let _ = recorder.save_event(&event).await;
+    }
+}
+
+async fn refresh_association_if_late_bound(
+    association: &Arc<tokio::sync::Mutex<RuntimeAssociation>>,
+    protocol: Protocol,
+    correlator: &TraceCorrelator,
+    recorder: &Option<Arc<Recorder>>,
+    peer_port: u16,
+) {
+    let current = association.lock().await.clone();
+    if current.trace_id != "orphan" {
+        return;
+    }
+
+    let Some(live_assoc) = correlator.lookup_live_association(peer_port).await else {
+        return;
+    };
+
+    {
+        let mut assoc = association.lock().await;
+        if assoc.trace_id != "orphan" {
+            return;
+        }
+        assoc.scope_id = live_assoc.scope_id.clone();
+        assoc.trace_id = live_assoc.trace_id.clone();
+    }
+
+    if let Some(rec) = recorder {
+        let buffered = correlator
+            .flush_buffered_events_on_bind(peer_port, &live_assoc.scope_id, &live_assoc.trace_id)
+            .await;
+        if !buffered.is_empty() {
+            info!(
+                peer_port = peer_port,
+                trace_id = %live_assoc.trace_id,
+                protocol = %protocol,
+                count = buffered.len(),
+                "Late-bound buffered events to trace"
+            );
+            persist_buffered_events(
+                buffered,
+                &live_assoc.scope_id,
+                &live_assoc.trace_id,
+                correlator,
+                rec,
+            )
+            .await;
+        }
+    }
+}
+
 async fn process_client_events(
     events: Vec<RecordedEvent>,
     association: &Arc<tokio::sync::Mutex<RuntimeAssociation>>,
+    protocol: Protocol,
     protocol_id: &str,
     correlator: &TraceCorrelator,
     recorder: &Option<Arc<Recorder>>,
@@ -216,13 +292,13 @@ async fn process_client_events(
     connection_start: tokio::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_record_mode = recorder.is_some() && replay_engine.is_none();
+    refresh_association_if_late_bound(association, protocol, correlator, recorder, peer_port).await;
 
     for mut event in events {
         let assoc = association.lock().await.clone();
 
-        // In record mode with orphan association, buffer a copy for potential retro-binding
-        // while the window is still open, but always fall through to record as orphan.
-        // This ensures events are never silently lost if the proxy is killed.
+        // Buffer unresolved events until the connection is either late-bound or drained
+        // on connection close as a real orphan.
         if is_record_mode
             && assoc.trace_id == "orphan"
             && retro_bind_window_ms > 0
@@ -232,10 +308,11 @@ async fn process_client_events(
                 .buffer_event_for_retro_bind(
                     peer_port,
                     retro_bind_window_ms,
-                    event.clone(),
+                    event,
                     EventDirection::ClientToServer,
                 )
                 .await;
+            continue;
         }
 
         let stream_id = extract_stream_id(&event);
@@ -326,11 +403,34 @@ async fn process_client_events(
 async fn process_server_events(
     events: Vec<RecordedEvent>,
     association: &Arc<tokio::sync::Mutex<RuntimeAssociation>>,
+    protocol: Protocol,
     correlator: &TraceCorrelator,
     recorder: &Option<Arc<Recorder>>,
+    peer_port: u16,
+    retro_bind_window_ms: u64,
+    connection_start: tokio::time::Instant,
 ) {
+    let is_record_mode = recorder.is_some();
+    refresh_association_if_late_bound(association, protocol, correlator, recorder, peer_port).await;
+
     for mut event in events {
         let assoc = association.lock().await.clone();
+
+        if is_record_mode
+            && assoc.trace_id == "orphan"
+            && retro_bind_window_ms > 0
+            && connection_start.elapsed() < std::time::Duration::from_millis(retro_bind_window_ms)
+        {
+            correlator
+                .buffer_event_for_retro_bind(
+                    peer_port,
+                    retro_bind_window_ms,
+                    event,
+                    EventDirection::ServerToClient,
+                )
+                .await;
+            continue;
+        }
 
         let stream_id = extract_stream_id(&event);
 
@@ -1176,6 +1276,11 @@ pub async fn handle_tls_connection(
         is_record_mode,
     )
     .await;
+    if let Some(a) = &assoc {
+        correlator
+            .register_live_association(peer_port, a.clone())
+            .await;
+    }
     let (scope_id, trace_id) = match &assoc {
         Some(a) => (a.scope_id.clone(), a.trace_id.clone()),
         None => {
@@ -1223,6 +1328,7 @@ pub async fn handle_tls_connection(
                 process_client_events(
                     res.events,
                     &association,
+                    protocol,
                     &protocol_id,
                     &correlator,
                     &recorder,
@@ -1268,6 +1374,7 @@ pub async fn handle_tls_connection(
     let rep_c = replay_engine.clone();
     let corr_c = correlator.clone();
     let assoc_c = association.clone();
+    let protocol_c = protocol;
     let proto_c = protocol_id.clone();
     let peer_port_c = peer_port;
     let retro_window_c = retro_bind_window_ms;
@@ -1289,6 +1396,7 @@ pub async fn handle_tls_connection(
                     process_client_events(
                         res.events,
                         &assoc_c,
+                        protocol_c,
                         &proto_c,
                         &corr_c,
                         &rec_c,
@@ -1371,7 +1479,17 @@ pub async fn handle_tls_connection(
                 let mut p = parser_t.lock().await;
                 match p.parse_server_data(&buf[..n]) {
                     Ok(res) => {
-                        process_server_events(res.events, &assoc_t, &corr_t, &rec_t).await;
+                        process_server_events(
+                            res.events,
+                            &assoc_t,
+                            protocol,
+                            &corr_t,
+                            &rec_t,
+                            peer_port,
+                            retro_bind_window_ms,
+                            connection_start,
+                        )
+                        .await;
 
                         if !res.forward.is_empty() {
                             let mut cw = c_write_t.lock().await;
@@ -1396,6 +1514,24 @@ pub async fn handle_tls_connection(
 
     tokio::try_join!(c_handle, t_handle)?;
 
+    if let Some(rec) = &recorder {
+        if let Some(live_assoc) = correlator.lookup_live_association(peer_port).await {
+            let flushed = correlator
+                .flush_buffered_events_on_bind(peer_port, &live_assoc.scope_id, &live_assoc.trace_id)
+                .await;
+            if !flushed.is_empty() {
+                persist_buffered_events(
+                    flushed,
+                    &live_assoc.scope_id,
+                    &live_assoc.trace_id,
+                    &correlator,
+                    rec,
+                )
+                .await;
+            }
+        }
+    }
+
     // Flush remaining buffered events as orphan after connection ends
     if is_record_mode && retro_bind_window_ms > 0 {
         let expired = correlator.quarantine_expired_events(peer_port).await;
@@ -1414,6 +1550,7 @@ pub async fn handle_tls_connection(
             correlator.add_to_quarantine(peer_port, expired).await;
         }
     }
+    correlator.clear_live_association(peer_port).await;
 
     Ok(())
 }
@@ -1475,6 +1612,11 @@ pub async fn handle_connection(
         is_record_mode,
     )
     .await;
+    if let Some(a) = &assoc {
+        correlator
+            .register_live_association(peer_addr.port(), a.clone())
+            .await;
+    }
     let (scope_id, trace_id) = match assoc {
         Some(a) => (a.scope_id, a.trace_id),
         None => {
@@ -1536,6 +1678,7 @@ pub async fn handle_connection(
     let rep_c = replay_engine.clone();
     let corr_c = correlator.clone();
     let assoc_c = association.clone();
+    let protocol_c = protocol;
     let proto_c = protocol_id.clone();
     let peer_port_c = peer_addr.port();
     let retro_window_c = retro_bind_window_ms;
@@ -1557,6 +1700,7 @@ pub async fn handle_connection(
                     process_client_events(
                         res.events,
                         &assoc_c,
+                        protocol_c,
                         &proto_c,
                         &corr_c,
                         &rec_c,
@@ -1638,7 +1782,17 @@ pub async fn handle_connection(
 
                 let mut p = parser_t.lock().await;
                 if let Ok(res) = p.parse_server_data(&buf[..n]) {
-                    process_server_events(res.events, &assoc_t, &corr_t, &rec_t).await;
+                    process_server_events(
+                        res.events,
+                        &assoc_t,
+                        protocol,
+                        &corr_t,
+                        &rec_t,
+                        peer_addr.port(),
+                        retro_bind_window_ms,
+                        connection_start,
+                    )
+                    .await;
                     let mut cw = c_write_t.lock().await;
                     cw.write_all(&res.forward)
                         .await
@@ -1657,6 +1811,25 @@ pub async fn handle_connection(
     };
 
     tokio::try_join!(c_handle, t_handle)?;
+
+    if let Some(rec) = &recorder {
+        let peer_port = peer_addr.port();
+        if let Some(live_assoc) = correlator.lookup_live_association(peer_port).await {
+            let flushed = correlator
+                .flush_buffered_events_on_bind(peer_port, &live_assoc.scope_id, &live_assoc.trace_id)
+                .await;
+            if !flushed.is_empty() {
+                persist_buffered_events(
+                    flushed,
+                    &live_assoc.scope_id,
+                    &live_assoc.trace_id,
+                    &correlator,
+                    rec,
+                )
+                .await;
+            }
+        }
+    }
 
     // Flush remaining buffered events as orphan after connection ends
     if is_record_mode && retro_bind_window_ms > 0 {
@@ -1677,6 +1850,7 @@ pub async fn handle_connection(
             correlator.add_to_quarantine(peer_port, expired).await;
         }
     }
+    correlator.clear_live_association(peer_addr.port()).await;
 
     Ok(())
 }

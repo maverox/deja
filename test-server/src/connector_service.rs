@@ -3,10 +3,9 @@ use crate::connector::{ProcessRequest, ProcessResponse};
 use crate::db_pools::DatabasePools;
 use deja_sdk::{
     association::{associate_pg_connection, associate_redis_connection},
-    deja_run, generate_trace_id, get_runtime,
+    current_task_id, current_trace_id, deja_run, generate_trace_id, get_runtime,
     reqwest::DejaClient,
-    trace_context::current_trace_id,
-    ControlMessage, DejaRuntime,
+    with_trace_context, ControlMessage, DejaRuntime,
 };
 
 use sqlx::Connection;
@@ -31,87 +30,106 @@ impl Connector for ConnectorService {
     ) -> Result<Response<ProcessResponse>, Status> {
         let req = request.into_inner();
         let runtime = get_runtime();
-
-        let control_client = runtime.control_client();
-        let trace_id = if !req.id.is_empty() {
-            let id = req.id.clone();
-            control_client
-                .send_best_effort(ControlMessage::start_trace(&id))
-                .await;
-            id
-        } else {
-            current_trace_id().unwrap_or_else(generate_trace_id)
-        };
+        let trace_id = current_trace_id()
+            .filter(|id| !id.is_empty())
+            .or_else(|| (!req.id.is_empty()).then(|| req.id.clone()))
+            .unwrap_or_else(generate_trace_id);
 
         info!(trace_id = %trace_id, request_id = %req.id, "Processing gRPC request");
 
-        deja_sdk::with_trace_id(trace_id.clone(), async move {
-            let generated_uuid = deja_run(&*runtime, "uuid", || Uuid::new_v4())
-                .await
-                .to_string();
-            let timestamp_ms = deja_run(&*runtime, "time", || {
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0)
-            })
-            .await;
+        if current_task_id().is_some() {
+            self.run_process(runtime, trace_id, req).await
+        } else {
+            let control_client = runtime.control_client();
+            let runtime_for_request = runtime.clone();
+            let trace_for_request = trace_id.clone();
 
-            let http_result = match self.do_http_work(&trace_id).await {
-                Ok(res) => res,
-                Err(e) => format!("HTTP Error: {}", e),
-            };
-
-            let redis_result = match self.do_redis_work(&trace_id, &req.id, &req.data).await {
-                Ok(res) => res,
-                Err(e) => format!("Redis Error: {}", e),
-            };
-
-            let redis_complex = match self.do_redis_complex_work(&trace_id).await {
-                Ok(res) => res,
-                Err(e) => format!("Redis Complex Error: {}", e),
-            };
-            let redis_result = format!("{}, {}", redis_result, redis_complex);
-
-            let pg_result = match self.do_pg_work(&trace_id, &req.id, &req.data).await {
-                Ok(res) => res,
-                Err(e) => format!("PG Error: {}", e),
-            };
-
-            let rt_clone = runtime.clone();
-            let trace_id_for_bg = trace_id.clone();
-            let _ = deja_sdk::spawn_traced({
-                let tid = trace_id_for_bg.clone();
-                async move {
-                    let _ = deja_sdk::with_trace_id(tid.clone(), async move {
-                        let _bg_uuid = deja_run(&*rt_clone, "bg_uuid", || Uuid::new_v4()).await;
-                        info!(trace_id = %tid, "Generated background UUID: {}", _bg_uuid);
-                    })
+            with_trace_context(trace_id.clone(), async move {
+                let task_id = current_task_id().unwrap_or_else(|| "0".to_string());
+                control_client
+                    .send_best_effort(ControlMessage::start_trace_with_task(
+                        &trace_for_request,
+                        &task_id,
+                    ))
                     .await;
-                }
-            });
 
-            runtime.flush().await;
+                let result = self
+                    .run_process(runtime_for_request, trace_for_request.clone(), req)
+                    .await;
 
-            control_client
-                .send_best_effort(ControlMessage::end_trace(&trace_id))
-                .await;
+                control_client
+                    .send_best_effort(ControlMessage::end_trace_with_task(
+                        &trace_for_request,
+                        &task_id,
+                    ))
+                    .await;
 
-            Ok(Response::new(ProcessResponse {
-                trace_id,
-                pg_result,
-                redis_result,
-                http_result,
-                status: "Success".to_string(),
-                generated_uuid,
-                timestamp_ms,
-            }))
-        })
-        .await
+                result
+            })
+            .await
+        }
     }
 }
 
 impl ConnectorService {
+    async fn run_process(
+        &self,
+        runtime: Arc<dyn DejaRuntime>,
+        trace_id: String,
+        req: ProcessRequest,
+    ) -> Result<Response<ProcessResponse>, Status> {
+        let generated_uuid = deja_run(&*runtime, "uuid", || Uuid::new_v4())
+            .await
+            .to_string();
+        let timestamp_ms = deja_run(&*runtime, "time", || {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        })
+        .await;
+
+        let http_result = match self.do_http_work(&trace_id).await {
+            Ok(res) => res,
+            Err(e) => format!("HTTP Error: {}", e),
+        };
+
+        let redis_result = match self.do_redis_work(&trace_id, &req.id, &req.data).await {
+            Ok(res) => res,
+            Err(e) => format!("Redis Error: {}", e),
+        };
+
+        let redis_complex = match self.do_redis_complex_work(&trace_id).await {
+            Ok(res) => res,
+            Err(e) => format!("Redis Complex Error: {}", e),
+        };
+        let redis_result = format!("{}, {}", redis_result, redis_complex);
+
+        let pg_result = match self.do_pg_work(&trace_id, &req.id, &req.data).await {
+            Ok(res) => res,
+            Err(e) => format!("PG Error: {}", e),
+        };
+
+        let runtime_for_bg = runtime.clone();
+        let trace_id_for_bg = trace_id.clone();
+        let _ = deja_sdk::spawn_traced(async move {
+            let bg_uuid = deja_run(&*runtime_for_bg, "bg_uuid", || Uuid::new_v4()).await;
+            info!(trace_id = %trace_id_for_bg, "Generated background UUID: {}", bg_uuid);
+        });
+
+        runtime.flush().await;
+
+        Ok(Response::new(ProcessResponse {
+            trace_id,
+            pg_result,
+            redis_result,
+            http_result,
+            status: "Success".to_string(),
+            generated_uuid,
+            timestamp_ms,
+        }))
+    }
+
     async fn do_redis_complex_work(&self, trace_id: &str) -> Result<String, String> {
         info!("Performing Redis complex work...");
 
