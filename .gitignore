@@ -1,12 +1,37 @@
+# Build artifacts
 target/
+dist/
+build/
+
+# Recordings & session data
 recordings/
+*.bin
+*.jsonl
+
+# Secrets & certificates
+certs/
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*.der
+.env*
+
+# Redis dumps
+dump.rdb
+
+# Logs
 *.log
+
+# IDE / Editor
 .DS_Store
 .idea/
 .vscode/
+
+# Dependencies
 node_modules/
-dist/
-build/
-*.bin
-*.jsonl
+
+# Internal tooling
 .sisyphus/
+tmp/
